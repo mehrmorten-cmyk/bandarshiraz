@@ -118,4 +118,61 @@ def run_sync():
 
         for p in pool:
             h = hashlib.md5(p['id'].encode()).hexdigest()
-            conn = get_db(); cur = con
+            conn = get_db(); cur = conn.cursor()
+            cur.execute("SELECT 1 FROM seen_news WHERE hash = %s", (h,))
+            if not cur.fetchone():
+                cat = ai_handler(p['text'], config['name'], "classify")
+                if cat and "NO" not in cat.upper():
+                    cap = f"<b>{cat}</b>\n📍 استان {config['name']}\n\n{p['text'][:900]}\n\n🔗 <a href='{p['id']}'>منبع اصلی</a>"
+                    kb = {"inline_keyboard": [[{"text": "📝 بازنویسی مقاومت", "callback_data": f"rw:{h}"}]]}
+                    tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/"
+                    try:
+                        res = None
+                        if p['type'] == "video" and p['media']:
+                            video_data = requests.get(p['media']).content
+                            res = requests.post(tg_url+"sendVideo", data={"chat_id":config['channel'], "caption":cap, "parse_mode":"HTML", "reply_markup":json.dumps(kb)}, files={"video":("v.mp4", video_data)})
+                        elif p['type'] == "photo" and p['media']:
+                            res = requests.post(tg_url+"sendPhoto", json={"chat_id":config['channel'], "photo":p['media'], "caption":cap, "parse_mode":"HTML", "reply_markup":kb})
+                        else:
+                            res = requests.post(tg_url+"sendMessage", json={"chat_id":config['channel'], "text":cap, "parse_mode":"HTML", "reply_markup":kb})
+                        
+                        if res and res.status_code == 200:
+                            m_id = res.json()['result']['message_id']
+                            cur.execute("INSERT INTO seen_news VALUES (%s)", (h,))
+                            cur.execute("INSERT INTO msg_logs (hash, channel_id, msg_id, title, prov, type) VALUES (%s,%s,%s,%s,%s,%s)", (h, config['channel'], str(m_id), p['text'][:1000], p_id, p['type']))
+                            conn.commit()
+                    except: pass
+            cur.close(); conn.close()
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    data = request.get_json(silent=True)
+    if not data or "callback_query" not in data: return "OK"
+    cb = data["callback_query"]; h = cb["data"][3:]
+    
+    # متوقف کردن لودینگ دکمه در تلگرام
+    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb["id"], "text": "⏳ در حال بازنویسی..."})
+    
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("SELECT title, channel_id, msg_id, prov, type FROM msg_logs WHERE hash = %s", (h,))
+    row = cur.fetchone()
+    if row:
+        title, c_id, m_id, prov, m_type = row
+        new_txt = ai_handler(title, prov, "rewrite")
+        if new_txt:
+            method = "editMessageCaption" if m_type != "text" else "editMessageText"
+            requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", 
+                         json={"chat_id": c_id, "message_id": int(m_id), "caption" if m_type != "text" else "text": f"✊ <b>نسخه مقاومت</b>\n\n{new_txt}", "parse_mode": "HTML"})
+    cur.close(); conn.close()
+    return "OK"
+
+@app.route('/check')
+def check():
+    threading.Thread(target=run_sync).start()
+    return "Syncing with all sources..."
+
+@app.route('/')
+def home(): return "Reference Hub v26 Online"
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
