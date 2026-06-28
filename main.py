@@ -11,29 +11,26 @@ from urllib.parse import quote
 from xml.etree import ElementTree
 from flask import Flask
 
-# تنظیمات اصلی
+# Config
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 PROVINCES = {
     "fars": {
         "name": "فارس",
         "channel": os.environ.get("CHANNEL_ID_FARS"),
-        "keywords": ["استان فارس", "شیراز", "مرودشت", "جهرم", "کازرون"]
+        "keywords": ["شیراز", "استان فارس", "مرودشت"]
     },
     "hormozgan": {
         "name": "هرمزگان",
         "channel": os.environ.get("CHANNEL_ID_HORMOZGAN"),
-        "keywords": ["هرمزگان", "بندرعباس", "قشم", "کیش", "میناب"]
+        "keywords": ["بندرعباس", "هرمزگان", "قشم"]
     }
 }
 
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
 
 def init_db():
-    """ساخت جدول دیتابیس در همان ابتدای کار"""
     try:
         conn = psycopg2.connect(DATABASE_URL, sslmode='require')
         cur = conn.cursor()
@@ -41,74 +38,60 @@ def init_db():
         conn.commit()
         cur.close()
         conn.close()
-        print("✅ Database connection successful and table ensured.")
+        print("✅ DB Connected & Table Ready")
     except Exception as e:
-        print(f"❌ DATABASE ERROR: {e}")
+        print(f"❌ DB Error: {e}")
 
-def is_seen(link_hash):
+def is_seen(h):
     try:
         conn = psycopg2.connect(DATABASE_URL, sslmode='require')
         cur = conn.cursor()
-        cur.execute("SELECT 1 FROM seen_news WHERE hash = %s", (link_hash,))
-        exists = cur.fetchone()
+        cur.execute("SELECT 1 FROM seen_news WHERE hash = %s", (h,))
+        res = cur.fetchone()
         cur.close()
         conn.close()
-        return exists is not None
+        return res is not None
     except: return False
 
-def mark_seen(link_hash):
+def mark_seen(h):
     try:
         conn = psycopg2.connect(DATABASE_URL, sslmode='require')
         cur = conn.cursor()
-        cur.execute("INSERT INTO seen_news (hash) VALUES (%s) ON CONFLICT DO NOTHING", (link_hash,))
+        cur.execute("INSERT INTO seen_news (hash) VALUES (%s) ON CONFLICT DO NOTHING", (h,))
         conn.commit()
         cur.close()
         conn.close()
     except: pass
 
 def run_check():
-    print("🚀 Starting news search cycle...")
+    print("🚀 Check Started...")
     for p_id, config in PROVINCES.items():
         if not config['channel']: continue
-        
         for kw in config['keywords']:
             try:
-                rss_url = f"https://news.google.com/rss/search?q={quote(kw)}+when:1d&hl=fa&gl=IR&ceid=IR:fa"
-                resp = requests.get(rss_url, timeout=15)
+                url = f"https://news.google.com/rss/search?q={quote(kw)}+when:1d&hl=fa&gl=IR&ceid=IR:fa"
+                resp = requests.get(url, timeout=10)
                 root = ElementTree.fromstring(resp.content)
-                items = root.findall(".//item")
-                
-                print(f"🔍 Searching {kw}... Found {len(items)} items.")
-                
-                for item in items[:5]:
+                for item in root.findall(".//item")[:5]:
                     link = item.findtext("link")
                     title = item.findtext("title")
                     h = hashlib.md5(link.encode()).hexdigest()
-                    
                     if not is_seen(h):
-                        print(f"📤 Sending new article: {title[:50]}...")
-                        msg = f"📍 <b>خبر تازه: استان {config['name']}</b>\n\n🔹 {title}\n\n🔗 <a href='{link}'>مشاهده منبع خبر</a>"
-                        tg_resp = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", 
-                                      json={"chat_id": config['channel'], "text": msg, "parse_mode": "HTML"})
-                        
-                        if tg_resp.status_code == 200:
-                            mark_seen(h)
-                        else:
-                            print(f"❌ Telegram Error: {tg_resp.text}")
-                        time.sleep(2)
-            except Exception as e:
-                print(f"⚠️ Error searching {kw}: {e}")
+                        txt = f"📍 <b>خبر {config['name']}</b>\n\n🔹 {title}\n\n🔗 <a href='{link}'>منبع</a>"
+                        send_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+                        r = requests.post(send_url, json={"chat_id": config['channel'], "text": txt, "parse_mode": "HTML"})
+                        if r.status_code == 200: mark_seen(h)
+                        time.sleep(1)
+            except: continue
 
 @app.route('/')
-def home():
-    return f"Bot is Online. Last check: {datetime.now()}"
+def home(): return "Online"
 
 @app.route('/check')
 def check():
     threading.Thread(target=run_check).start()
-    return "<h1>Check Started!</h1><p>The bot is now searching for news in the background. Check your Telegram channels.</p>"
+    return "Started"
 
-# اجرای خودکار دیتابیس موقع بالا آمدن برنامه
 init_db()
 
 if __name__ == "__main__":
