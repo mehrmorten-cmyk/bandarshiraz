@@ -1,9 +1,9 @@
-import os, json, time, psycopg2, hashlib, threading, requests, re, sys
+import os, json, time, psycopg2, hashlib, threading, requests, re, sys, logging
 from bs4 import BeautifulSoup
 from flask import Flask, request
 from xml.etree import ElementTree
 
-# تنظیمات لاگ
+# تنظیمات لاگ (رفع خطای NameError)
 logging.basicConfig(level=logging.INFO, stream=sys.stdout, format='%(asctime)s - %(message)s')
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -17,10 +17,10 @@ CATEGORIES = [
     "۷. آب، برق و گاز", "۸. اقتصاد، بازار و معیشت", "۹. اخبار شهرستان‌ها", "۱۰. جمع‌بندی", "۱۱. منابع"
 ]
 
-# منابع پیش‌فرض ایجنت (هوشمند)
+# منابع هوشمند
 SMART_SOURCES = {
-    "fars": ["shiraz_online", "akhbarshiraz", "asrshiraz", "fars_news_fars"],
-    "hormozgan": ["hormozgan_online", "bndonline", "akhbar_hormozgan", "hmd_news"]
+    "fars": ["shiraz_online", "akhbarshiraz", "asrshiraz"],
+    "hormozgan": ["hormozgan_online", "bndonline", "akhbar_hormozgan"]
 }
 
 app = Flask(__name__)
@@ -28,14 +28,16 @@ app = Flask(__name__)
 def get_db(): return psycopg2.connect(DATABASE_URL, sslmode='require')
 
 def init_db():
-    conn = get_db(); cur = conn.cursor()
-    cur.execute("CREATE TABLE IF NOT EXISTS seen_news (hash TEXT PRIMARY KEY)")
-    cur.execute("CREATE TABLE IF NOT EXISTS msg_logs (hash TEXT PRIMARY KEY, channel_id TEXT, msg_id TEXT, title TEXT, prov TEXT)")
-    cur.execute("CREATE TABLE IF NOT EXISTS manual_sources (username TEXT PRIMARY KEY, province TEXT)")
-    conn.commit(); cur.close(); conn.close()
+    try:
+        conn = get_db(); cur = conn.cursor()
+        cur.execute("CREATE TABLE IF NOT EXISTS seen_news (hash TEXT PRIMARY KEY)")
+        cur.execute("CREATE TABLE IF NOT EXISTS msg_logs (hash TEXT PRIMARY KEY, channel_id TEXT, msg_id TEXT, title TEXT, prov TEXT, type TEXT)")
+        cur.execute("CREATE TABLE IF NOT EXISTS manual_sources (username TEXT PRIMARY KEY, province TEXT)")
+        conn.commit(); cur.close(); conn.close()
+    except Exception as e: logging.error(f"DB Error: {e}")
 
 def ai_classify(text):
-    """دسته‌بندی در ۱۱ موضوع استراتژیک"""
+    if not GEMINI_API_KEY: return "سایر اخبار"
     prompt = f"متن خبر را فقط در یکی از این ۱۱ دسته قرار بده و فقط نام دسته را برگردان:\n{', '.join(CATEGORIES)}\n\nخبر:\n{text[:400]}"
     try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
@@ -44,9 +46,9 @@ def ai_classify(text):
     except: return "۹. اخبار شهرستان‌ها"
 
 def scrape_tg(tg_user):
-    """رصد مدیا و متن مطابق متد ویکتور"""
     items = []
     try:
+        logging.info(f"Checking @{tg_user}...")
         url = f"https://t.me/s/{tg_user}"
         soup = BeautifulSoup(requests.get(url, timeout=15).text, 'html.parser')
         msgs = soup.find_all("div", class_="tgme_widget_message_wrap")
@@ -67,21 +69,19 @@ def scrape_tg(tg_user):
                     match = re.search(r"url\('([^']+)'\)", style)
                     if match: post["media"] = match.group(1); post["type"] = "photo"
             if post["text"]: items.append(post)
-    except: pass
+    except Exception as e: logging.error(f"Scrape error: {e}")
     return items
 
 def run_check():
     init_db()
     conn = get_db(); cur = conn.cursor()
-    # خواندن منابع دستی اضافه شده از تلگرام یا Env
     cur.execute("SELECT username, province FROM manual_sources")
     manuals = cur.fetchall()
     
-    # ترکیب منابع هوشمند و دستی
-    for p_id, config in {"fars": "-1004352884396", "hormozgan": "-1003915149928"}.items():
+    prov_map = {"fars": "-1004352884396", "hormozgan": "-1003915149928"}
+    for p_id, channel in prov_map.items():
         sources = SMART_SOURCES[p_id] + [m[0] for m in manuals if m[1] == p_id]
-        
-        for src in set(sources): # حذف همپوشانی
+        for src in set(sources):
             posts = scrape_tg(src)
             for p in posts:
                 h = hashlib.md5(str(p['id']).encode()).hexdigest()
@@ -93,47 +93,51 @@ def run_check():
                     
                     tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/"
                     res = None
-                    if p['type'] == "video" and p['media']:
-                        video_data = requests.get(p['media']).content
-                        res = requests.post(tg_url+"sendVideo", data={"chat_id":config, "caption":caption, "parse_mode":"HTML", "reply_markup":json.dumps(kb)}, files={"video":("v.mp4", video_data)})
-                    elif p['type'] == "photo" and p['media']:
-                        res = requests.post(tg_url+"sendPhoto", json={"chat_id":config, "photo":p['media'], "caption":caption, "parse_mode":"HTML", "reply_markup":kb})
-                    else:
-                        res = requests.post(tg_url+"sendMessage", json={"chat_id":config, "text":caption, "parse_mode":"HTML", "reply_markup":kb})
+                    try:
+                        if p['type'] == "video" and p['media']:
+                            v_data = requests.get(p['media']).content
+                            res = requests.post(tg_url+"sendVideo", data={"chat_id":channel, "caption":caption, "parse_mode":"HTML", "reply_markup":json.dumps(kb)}, files={"video":("v.mp4", v_data)})
+                        elif p['type'] == "photo" and p['media']:
+                            res = requests.post(tg_url+"sendPhoto", json={"chat_id":channel, "photo":p['media'], "caption":caption, "parse_mode":"HTML", "reply_markup":kb})
+                        else:
+                            res = requests.post(tg_url+"sendMessage", json={"chat_id":channel, "text":caption, "parse_mode":"HTML", "reply_markup":kb})
 
-                    if res and res.status_code == 200:
-                        m_id = res.json()['result']['message_id']
-                        cur.execute("INSERT INTO seen_news VALUES (%s)", (h,))
-                        cur.execute("INSERT INTO msg_logs VALUES (%s,%s,%s,%s,%s)", (h, config, str(m_id), p['text'][:200], p_id))
-                        conn.commit()
+                        if res and res.status_code == 200:
+                            m_id = res.json()['result']['message_id']
+                            cur.execute("INSERT INTO seen_news VALUES (%s)", (h,))
+                            cur.execute("INSERT INTO msg_logs VALUES (%s,%s,%s,%s,%s,%s)", (h, channel, str(m_id), p['text'][:400], p_id, p['type']))
+                            conn.commit()
+                    except: continue
     cur.close(); conn.close()
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    data = request.json
+    if "callback_query" in data:
+        cb = data["callback_query"]; h = cb["data"][3:]
+        conn = get_db(); cur = conn.cursor()
+        cur.execute("SELECT title, channel_id, msg_id, prov, type FROM msg_logs WHERE hash = %s", (h,))
+        row = cur.fetchone()
+        if row:
+            title, c_id, m_id, prov, m_type = row
+            requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb["id"], "text": "⏳ در حال بازنویسی..."})
+            prompt = f"این خبر را با واژگان انقلابی (رژیم، قیام، کانون‌های شورشی) بازنویسی کن. فقط متن نهایی را بده:\n{title}"
+            r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}", json={"contents": [{"parts": [{"text": prompt}]}]})
+            new_txt = r.json()['candidates'][0]['content']['parts'][0]['text'].strip()
+            
+            method = "editMessageCaption" if m_type != "text" else "editMessageText"
+            requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", 
+                         json={"chat_id": c_id, "message_id": int(m_id), "caption" if m_type != "text" else "text": f"✊ <b>نسخه مقاومت</b>\n\n{new_txt}", "parse_mode": "HTML"})
+        cur.close(); conn.close()
+    return "OK"
 
 @app.route('/check')
 def check():
     threading.Thread(target=run_check).start()
     return "Check started."
 
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    data = request.json
-    if "message" in data and "text" in data["message"]:
-        msg = data["message"]; text = msg["text"]
-        # دستور اضافه کردن کانال جدید از تلگرام: /add fars channel_id
-        if text.startswith("/add"):
-            parts = text.split()
-            if len(parts) == 3:
-                conn = get_db(); cur = conn.cursor()
-                cur.execute("INSERT INTO manual_sources VALUES (%s, %s) ON CONFLICT DO NOTHING", (parts[2], parts[1]))
-                conn.commit(); cur.close(); conn.close()
-                requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={"chat_id":msg["chat"]["id"], "text":"✅ منبع با موفقیت اضافه شد."})
-
-    if "callback_query" in data:
-        # منطق بازنویسی (بدون تغییر)
-        pass
-    return "OK"
-
 @app.route('/')
-def home(): return "Hybrid News Bot Online"
+def home(): return "Bot Online v17"
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
