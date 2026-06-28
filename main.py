@@ -5,7 +5,7 @@ from xml.etree import ElementTree
 from datetime import datetime, timedelta
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout, format='%(asctime)s - %(message)s')
-logger = logging.getLogger("STRICT_NEWS_V35")
+logger = logging.getLogger("HUB_FINAL_V36")
 
 BOT_TOKEN = "8842107952:AAFszVHNfL331IRN1YWIi6hP9QTY4o3vhxk"
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -21,11 +21,13 @@ HUB_CATEGORIES = [
 PROVINCES = {
     "fars": {
         "name": "فارس و شیراز", "channel": "-1004352884396",
-        "tg": ["akhbarfars", "shiraz_news", "shiraz_online", "FouriFars", "shiraz_ma"]
+        "tg": ["akhbarfars", "shiraz_news", "YeRoozeShiraz", "FouriFars", "shiraz_online"],
+        "rss": ["https://www.irna.ir/rss/service/131", "https://www.tasnimnews.com/fa/rss/service/0/8"]
     },
     "hormozgan": {
         "name": "هرمزگان و بندرعباس", "channel": "-1003915149928",
-        "tg": ["hormozgan_online", "bndonline", "bandarabbasnews", "akhbar_hormozgan", "hormozgan_today"]
+        "tg": ["hormozgan_online", "bndonline", "bandarabbasnews", "hormozgan_today", "akhbar_hormozgan"],
+        "rss": ["https://www.irna.ir/rss/service/151", "https://www.tasnimnews.com/fa/rss/service/0/13", "https://www.isna.ir/rss/service/77"]
     }
 }
 
@@ -42,8 +44,7 @@ def ai_tag(text):
         return resp.json()['candidates'][0]['content']['parts'][0]['text'].strip()
     except: return "۱۱. عمومی"
 
-def scrape_tg_fresh(user):
-    """استخراج فقط اخبار ۲۴ ساعت اخیر"""
+def scrape_tg_v36(user):
     items = []
     try:
         url = f"https://t.me/s/{user}"
@@ -52,22 +53,20 @@ def scrape_tg_fresh(user):
         msgs = soup.find_all("div", class_="tgme_widget_message_wrap")
         
         now = datetime.now()
-        for w in msgs:
+        for w in msgs[-30:]: # بررسی ۳۰ پیام آخر
             m = w.find("div", class_="tgme_widget_message")
-            time_tag = w.find("time")
-            if not m or not time_tag: continue
+            t_tag = w.find("time")
+            if not m or not t_tag: continue
             
-            # چک کردن تاریخ (بسیار مهم)
-            msg_date = time_tag.get("datetime") # فرمت: 2024-06-28T18:45:00+00:00
-            dt = datetime.fromisoformat(msg_date.replace('Z', '+00:00')).replace(tzinfo=None)
-            
-            # اگر پیام قدیمی‌تر از ۲۴ ساعت بود، ردش کن
+            # فیلتر زمان: فقط امروز
+            dt = datetime.fromisoformat(t_tag.get("datetime").replace('Z', '+00:00')).replace(tzinfo=None)
             if now - dt > timedelta(hours=24): continue
 
             post = {"text": "", "media": None, "type": "text", "id": m.get("data-post")}
             txt_div = m.find("div", class_="tgme_widget_message_text")
             if txt_div: post["text"] = txt_div.get_text(separator="\n").strip()
             
+            # استخراج هوشمند مدیا
             v = m.find('video')
             if v: post["media"] = v.get('src'); post["type"] = "video"
             else:
@@ -83,48 +82,56 @@ def scrape_tg_fresh(user):
 
 def run_sync():
     conn = get_db(); cur = conn.cursor()
-    cur.execute("CREATE TABLE IF NOT EXISTS seen_v35 (hash TEXT PRIMARY KEY, ts TIMESTAMP DEFAULT NOW())")
+    cur.execute("CREATE TABLE IF NOT EXISTS seen_v36 (hash TEXT PRIMARY KEY, ts TIMESTAMP DEFAULT NOW())")
     conn.commit(); cur.close(); conn.close()
 
     for p_id, config in PROVINCES.items():
         logger.info(f"--- 📡 SCANNING {p_id.upper()} ---")
-        for src in config['tg']:
-            posts = scrape_tg_fresh(src)
-            for p in posts:
-                h = hashlib.md5(str(p['id']).encode()).hexdigest()
-                conn = get_db(); cur = conn.cursor()
-                cur.execute("SELECT 1 FROM seen_v35 WHERE hash = %s", (h,))
-                if not cur.fetchone():
-                    tag = ai_tag(p['text'])
-                    cap = f"<b>{tag}</b>\n📍 استان {config['name']}\n\n{p['text'][:900]}\n\n🔗 <a href='https://t.me/{p['id']}'>منبع اصلی</a>"
+        pool = []
+        # ۱. تلگرام
+        for src in config['tg']: pool.extend(scrape_tg_v36(src))
+        # ۲. خبرگزاری ها (تضمین محتوا برای بندرعباس)
+        for url in config['rss']:
+            try:
+                root = ElementTree.fromstring(requests.get(url, timeout=10).content)
+                for i in root.findall(".//item")[:10]:
+                    pool.append({"text": i.findtext("title"), "id": i.findtext("link"), "type": "text", "media": None})
+            except: continue
+
+        for p in pool:
+            h = hashlib.md5(str(p['id']).encode()).hexdigest()
+            conn = get_db(); cur = conn.cursor()
+            cur.execute("SELECT 1 FROM seen_v36 WHERE hash = %s", (h,))
+            if not cur.fetchone():
+                tag = ai_tag(p['text'])
+                cap = f"<b>{tag}</b>\n📍 استان {config['name']}\n\n{p['text'][:900]}\n\n🔗 <a href='{p['id'] if 'http' in str(p['id']) else 'https://t.me/'+str(p['id'])}'>منبع خبر</a>"
+                
+                try:
+                    tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/"
+                    res = None
+                    if p['type'] == "video" and p['media']:
+                        res = requests.post(tg_url+"sendVideo", json={"chat_id":config['channel'], "video":p['media'], "caption":cap, "parse_mode":"HTML"})
+                    elif p['type'] == "photo" and p['media']:
+                        res = requests.post(tg_url+"sendPhoto", json={"chat_id":config['channel'], "photo":p['media'], "caption":cap, "parse_mode":"HTML"})
                     
-                    try:
-                        tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/"
-                        res = None
-                        if p['type'] == "video" and p['media']:
-                            v_data = requests.get(p['media'], timeout=20).content
-                            res = requests.post(tg_url+"sendVideo", data={"chat_id":config['channel'], "caption":cap, "parse_mode":"HTML"}, files={"video":("v.mp4", v_data)})
-                        elif p['type'] == "photo" and p['media']:
-                            res = requests.post(tg_url+"sendPhoto", json={"chat_id":config['channel'], "photo":p['media'], "caption":cap, "parse_mode":"HTML"})
-                        
-                        if not res or res.status_code != 200:
-                            res = requests.post(tg_url+"sendMessage", json={"chat_id":config['channel'], "text":cap, "parse_mode":"HTML"})
-                        
-                        if res.status_code == 200:
-                            cur.execute("INSERT INTO seen_v35 (hash) VALUES (%s)", (h,))
-                            conn.commit()
-                            logger.info(f"✅ SENT FRESH: {p['id']}")
-                    except: pass
-                cur.close(); conn.close()
-                time.sleep(1)
+                    if not res or res.status_code != 200:
+                        res = requests.post(tg_url+"sendMessage", json={"chat_id":config['channel'], "text":cap, "parse_mode":"HTML"})
+                    
+                    if res.status_code == 200:
+                        cur.execute("INSERT INTO seen_v36 (hash) VALUES (%s)", (h,))
+                        conn.commit()
+                        logger.info(f"✅ SUCCESS: {p['id']}")
+                except: pass
+            cur.close(); conn.close()
+            time.sleep(2)
 
 @app.route('/check')
 def check():
     threading.Thread(target=run_sync).start()
-    return "Strict Time Sync Started (24h limit)."
+    return "Ref Hub v36 Syncing..."
 
 @app.route('/')
-def home(): return "Fresh News Engine Online"
+def home(): return "Province Hub v36 Online"
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
