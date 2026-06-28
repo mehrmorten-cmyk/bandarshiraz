@@ -2,22 +2,17 @@ import os
 import requests
 from flask import Flask
 
-# تنظیمات پایه
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-CHANNEL_FARS = "-1004352884396"
-CHANNEL_HORMOZGAN = "-1003915149928"
-
 app = Flask(__name__)
 
-def send_test_message(chat_id, province_name):
+# دریافت اطلاعات از رندر
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+FARS = "-1004352884396"
+HORMOZGAN = "-1003915149928"
+
+def send(chat_id, text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    text = f"✅ اتصال برقرار است!\n📍 این یک پیام تست برای استان {province_name} است.\nسیستم آماده دریافت اخبار می‌باشد."
-    payload = {"chat_id": chat_id, "text": text}
-    try:
-        r = requests.post(url, json=payload)
-        return r.json()
-    except Exception as e:
-        return str(e)
+    r = requests.post(url, json={"chat_id": chat_id, "text": text})
+    return r.json()
 
 @app.route('/')
 def home():
@@ -25,14 +20,13 @@ def home():
 
 @app.route('/check')
 def check():
-    # ارسال مستقیم به هر دو کانال برای تست اتصال
-    res_fars = send_test_message(CHANNEL_FARS, "فارس")
-    res_hormozgan = send_test_message(CHANNEL_HORMOZGAN, "هرمزگان")
+    # ارسال مستقیم و نمایش نتیجه در مرورگر (بدون ترد و پس‌زمینه)
+    res1 = send(FARS, "🔴 تست اتصال: کانال استان فارس برقرار است.")
+    res2 = send(HORMOZGAN, "🔵 تست اتصال: کانال استان هرمزگان برقرار است.")
     
     return {
-        "status": "Test messages sent",
-        "fars_response": res_fars,
-        "hormozgan_response": res_hormozgan
+        "fars_result": res1,
+        "hormozgan_result": res2
     }
 
 if __name__ == "__main__":
