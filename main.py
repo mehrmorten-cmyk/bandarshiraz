@@ -33,7 +33,6 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
 def get_db():
-    # استخراج اطلاعات از DATABASE_URL برای pg8000
     p = urlparse(DATABASE_URL)
     return pg8000.native.Connection(
         user=p.username,
@@ -82,7 +81,7 @@ def run_check():
                     h = hashlib.md5(link.encode()).hexdigest()
                     
                     if not is_seen(h):
-                        msg = f"📍 <b>خبر تازه: استان {config['name']}</b>\n\n🔹 {title}\n\n🔗 <a href='{link}'>منبع خبر</a>"
+                        msg = f"📍 <b>خبر تازه: استان {config['name']}</b>\n\n🔹 {title}\n\n🔗 <a href='{link}'>مشاهده منبع خبر</a>"
                         requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", 
                                       json={"chat_id": config['channel'], "text": msg, "parse_mode": "HTML"})
                         mark_seen(h)
@@ -91,7 +90,7 @@ def run_check():
                 logging.error(f"Error in {kw}: {e}")
 
 @app.route('/')
-def home(): return "Bot is Online (v2.1)"
+def home(): return "Bot is Online"
 
 @app.route('/check')
 def check():
