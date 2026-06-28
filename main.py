@@ -6,121 +6,130 @@ import logging
 import hashlib
 import threading
 import requests
+import re
 from datetime import datetime
 from urllib.parse import quote
 from xml.etree import ElementTree
 from flask import Flask
 
-# تنظیمات لاگ برای مشاهده دقیق جزئیات در رندر
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# دریافت تنظیمات از محیط
+# Configuration
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-# پیکربندی استان‌ها
+# Provinces & Sources
 PROVINCES = {
     "fars": {
         "name": "فارس",
         "channel": os.environ.get("CHANNEL_ID_FARS"),
-        "keywords": ["شیراز", "استان فارس", "مرودشت", "کازرون"]
+        "keywords": ["شیراز", "استان فارس", "مرودشت", "کازرون", "جهرم"],
+        "rss_feeds": [
+            "https://www.tasnimnews.com/fa/rss/service/0/8", # تسنیم فارس
+            "https://www.irna.ir/rss/service/131"            # ایرنا فارس
+        ]
     },
     "hormozgan": {
         "name": "هرمزگان",
         "channel": os.environ.get("CHANNEL_ID_HORMOZGAN"),
-        "keywords": ["بندرعباس", "استان هرمزگان", "قشم", "کیش"]
+        "keywords": ["هرمزگان", "بندرعباس", "قشم", "کیش", "میناب"],
+        "rss_feeds": [
+            "https://www.tasnimnews.com/fa/rss/service/0/13", # تسنیم هرمزگان
+            "https://www.irna.ir/rss/service/151"             # ایرنا هرمزگان
+        ]
     }
 }
 
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
+
+def get_db():
+    return psycopg2.connect(DATABASE_URL, sslmode='require')
 
 def init_db():
-    """ایجاد جداول دیتابیس در صورت عدم وجود"""
     try:
-        conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+        conn = get_db()
         cur = conn.cursor()
         cur.execute("CREATE TABLE IF NOT EXISTS seen_news (hash TEXT PRIMARY KEY, ts TIMESTAMP DEFAULT NOW())")
         conn.commit()
         cur.close()
         conn.close()
-        logger.info("✅ Database initialized successfully.")
     except Exception as e:
-        logger.error(f"❌ Database Init Error: {e}")
+        print(f"DB Error: {e}")
 
-def is_seen(link_hash):
-    """بررسی تکراری بودن خبر"""
-    conn = None
+def is_seen(h):
     try:
-        conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+        conn = get_db()
         cur = conn.cursor()
-        cur.execute("SELECT 1 FROM seen_news WHERE hash = %s", (link_hash,))
+        cur.execute("SELECT 1 FROM seen_news WHERE hash = %s", (h,))
         res = cur.fetchone()
         cur.close()
+        conn.close()
         return res is not None
-    except Exception as e:
-        logger.error(f"Database query error: {e}")
-        return False
-    finally:
-        if conn: conn.close()
+    except: return False
 
-def mark_seen(link_hash):
-    """ذخیره خبر در دیتابیس"""
-    conn = None
+def mark_seen(h):
     try:
-        conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+        conn = get_db()
         cur = conn.cursor()
-        cur.execute("INSERT INTO seen_news (hash) VALUES (%s) ON CONFLICT DO NOTHING", (link_hash,))
+        cur.execute("INSERT INTO seen_news (hash) VALUES (%s) ON CONFLICT DO NOTHING", (h,))
         conn.commit()
         cur.close()
-    except Exception as e:
-        logger.error(f"Database insert error: {e}")
-    finally:
-        if conn: conn.close()
+        conn.close()
+    except: pass
+
+def gemini_rewrite(title, province):
+    """بازنویسی خبر با پروتکل مقاومت توسط هوش مصنوعی"""
+    if not GEMINI_API_KEY: return title
+    prompt = f"خبر زیر را درباره استان {province} با لحن خبری و انقلابی (پروتکل مقاومت) بازنویسی کن. از کلمات رژیم، قیام و کانون‌های شورشی در صورت تناسب استفاده کن. فقط عنوان نهایی را بده:\n{title}"
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+        resp = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=20)
+        return resp.json()['candidates'][0]['content']['parts'][0]['text'].strip()
+    except: return title
+
+def fetch_rss(url):
+    try:
+        resp = requests.get(url, timeout=15)
+        root = ElementTree.fromstring(resp.content)
+        return [{"title": i.findtext("title"), "link": i.findtext("link")} for i in root.findall(".//item")[:10]]
+    except: return []
+
+def search_google_x(keyword):
+    """جستجوی پست‌های ایکس/توییتر از طریق گوگل"""
+    try:
+        q = quote(f"{keyword} site:x.com OR site:twitter.com")
+        url = f"https://news.google.com/rss/search?q={q}+when:1d&hl=fa&gl=IR&ceid=IR:fa"
+        resp = requests.get(url, timeout=15)
+        root = ElementTree.fromstring(resp.content)
+        return [{"title": i.findtext("title"), "link": i.findtext("link")} for i in root.findall(".//item")[:5]]
+    except: return []
 
 def run_check():
-    """چرخه جستجو و ارسال خبر"""
-    logger.info("🚀 News check cycle started...")
+    print("🚀 Advanced Scraper Started...")
     for p_id, config in PROVINCES.items():
         if not config['channel']: continue
         
+        all_news = []
+        # ۱. چک کردن RSS مستقیم خبرگزاری‌ها
+        for feed in config['rss_feeds']:
+            all_news.extend(fetch_rss(feed))
+        
+        # ۲. چک کردن ایکس (توییتر) و اخبار عمومی گوگل
         for kw in config['keywords']:
-            try:
-                # جستجو در گوگل نیوز
-                url = f"https://news.google.com/rss/search?q={quote(kw)}+when:1d&hl=fa&gl=IR&ceid=IR:fa"
-                resp = requests.get(url, timeout=15)
-                root = ElementTree.fromstring(resp.content)
-                
-                for item in root.findall(".//item")[:5]:
-                    link = item.findtext("link")
-                    title = item.findtext("title")
-                    link_hash = hashlib.md5(link.encode()).hexdigest()
-                    
-                    if not is_seen(link_hash):
-                        logger.info(f"New article for {config['name']}: {title[:50]}")
-                        msg = f"📍 <b>خبر تازه: استان {config['name']}</b>\n\n🔹 {title}\n\n🔗 <a href='{link}'>مشاهده منبع</a>"
-                        
-                        # ارسال به تلگرام
-                        tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-                        tg_resp = requests.post(tg_url, json={"chat_id": config['channel'], "text": msg, "parse_mode": "HTML"})
-                        
-                        if tg_resp.status_code == 200:
-                            mark_seen(link_hash)
-                        time.sleep(2) # وقفه برای جلوگیری از اسپم
-            except Exception as e:
-                logger.error(f"Error checking {kw}: {e}")
+            all_articles = fetch_rss(f"https://news.google.com/rss/search?q={quote(kw)}+when:1d&hl=fa&gl=IR&ceid=IR:fa")
+            all_news.extend(all_articles)
+            all_news.extend(search_google_x(kw))
+        
+        # پردازش و ارسال
+        for news in all_news:
+            h = hashlib.md5(news['link'].encode()).hexdigest()
+            if not is_seen(h):
+                final_title = gemini_rewrite(news['title'], config['name'])
+                msg = f"📍 <b>خبر تازه: {config['name']}</b>\n\n🔹 {final_title}\n\n🔗 <a href='{news['link']}'>مشاهده منبع</a>"
+                requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", 
+                             json={"chat_id": config['channel'], "text": msg, "parse_mode": "HTML"})
+                mark_seen(h)
+                time.sleep(2)
 
 @app.route('/')
-def home(): return "Bot status: Online"
-
-@app.route('/check')
-def check():
-    threading.Thread(target=run_check).start()
-    return "Check started. Monitoring logs..."
-
-# اجرای تنظیمات اولیه دیتابیس
-init_db()
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+def home(): retur
