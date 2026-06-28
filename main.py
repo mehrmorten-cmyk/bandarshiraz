@@ -1,13 +1,13 @@
 import os
 import json
 import time
-import pg8000.native
+import psycopg2
 import logging
 import hashlib
 import threading
 import requests
 from datetime import datetime
-from urllib.parse import quote, urlparse
+from urllib.parse import quote
 from xml.etree import ElementTree
 from flask import Flask
 
@@ -32,70 +32,84 @@ PROVINCES = {
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-def get_db():
-    p = urlparse(DATABASE_URL)
-    return pg8000.native.Connection(
-        user=p.username,
-        password=p.password,
-        host=p.hostname,
-        port=p.port,
-        database=p.path[1:],
-        ssl_context=True
-    )
-
 def init_db():
+    """ساخت جدول دیتابیس در همان ابتدای کار"""
     try:
-        db = get_db()
-        db.run("CREATE TABLE IF NOT EXISTS seen_news (hash TEXT PRIMARY KEY, ts TIMESTAMP DEFAULT NOW())")
-        logging.info("Database Ready.")
+        conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE IF NOT EXISTS seen_news (hash TEXT PRIMARY KEY, ts TIMESTAMP DEFAULT NOW())")
+        conn.commit()
+        cur.close()
+        conn.close()
+        print("✅ Database connection successful and table ensured.")
     except Exception as e:
-        logging.error(f"DB Init Error: {e}")
+        print(f"❌ DATABASE ERROR: {e}")
 
 def is_seen(link_hash):
     try:
-        db = get_db()
-        res = db.run("SELECT 1 FROM seen_news WHERE hash = :h", h=link_hash)
-        return len(res) > 0
+        conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM seen_news WHERE hash = %s", (link_hash,))
+        exists = cur.fetchone()
+        cur.close()
+        conn.close()
+        return exists is not None
     except: return False
 
 def mark_seen(link_hash):
     try:
-        db = get_db()
-        db.run("INSERT INTO seen_news (hash) VALUES (:h) ON CONFLICT DO NOTHING", h=link_hash)
+        conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+        cur = conn.cursor()
+        cur.execute("INSERT INTO seen_news (hash) VALUES (%s) ON CONFLICT DO NOTHING", (link_hash,))
+        conn.commit()
+        cur.close()
+        conn.close()
     except: pass
 
 def run_check():
-    init_db()
+    print("🚀 Starting news search cycle...")
     for p_id, config in PROVINCES.items():
         if not config['channel']: continue
-        logging.info(f"Checking {config['name']}...")
         
         for kw in config['keywords']:
             try:
                 rss_url = f"https://news.google.com/rss/search?q={quote(kw)}+when:1d&hl=fa&gl=IR&ceid=IR:fa"
-                resp = requests.get(rss_url, timeout=10)
+                resp = requests.get(rss_url, timeout=15)
                 root = ElementTree.fromstring(resp.content)
-                for item in root.findall(".//item")[:5]:
+                items = root.findall(".//item")
+                
+                print(f"🔍 Searching {kw}... Found {len(items)} items.")
+                
+                for item in items[:5]:
                     link = item.findtext("link")
                     title = item.findtext("title")
                     h = hashlib.md5(link.encode()).hexdigest()
                     
                     if not is_seen(h):
+                        print(f"📤 Sending new article: {title[:50]}...")
                         msg = f"📍 <b>خبر تازه: استان {config['name']}</b>\n\n🔹 {title}\n\n🔗 <a href='{link}'>مشاهده منبع خبر</a>"
-                        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", 
+                        tg_resp = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", 
                                       json={"chat_id": config['channel'], "text": msg, "parse_mode": "HTML"})
-                        mark_seen(h)
-                        time.sleep(1)
+                        
+                        if tg_resp.status_code == 200:
+                            mark_seen(h)
+                        else:
+                            print(f"❌ Telegram Error: {tg_resp.text}")
+                        time.sleep(2)
             except Exception as e:
-                logging.error(f"Error in {kw}: {e}")
+                print(f"⚠️ Error searching {kw}: {e}")
 
 @app.route('/')
-def home(): return "Bot is Online"
+def home():
+    return f"Bot is Online. Last check: {datetime.now()}"
 
 @app.route('/check')
 def check():
     threading.Thread(target=run_check).start()
-    return "Check Started"
+    return "<h1>Check Started!</h1><p>The bot is now searching for news in the background. Check your Telegram channels.</p>"
+
+# اجرای خودکار دیتابیس موقع بالا آمدن برنامه
+init_db()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
