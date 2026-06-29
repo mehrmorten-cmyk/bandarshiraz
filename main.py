@@ -4,9 +4,9 @@ from bs4 import BeautifulSoup
 from flask import Flask
 from datetime import datetime, timedelta, timezone
 
-# پیکربندی لاگ
+# پیکربندی لاگ حرفه‌ای
 logging.basicConfig(level=logging.INFO, stream=sys.stdout, format='%(asctime)s [%(levelname)s] %(message)s')
-logger = logging.getLogger("OSINT_V59")
+logger = logging.getLogger("OSINT_V60")
 
 BOT_TOKEN = "8842107952:AAFszVHNfL331IRN1YWIi6hP9QTY4o3vhxk"
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -31,7 +31,7 @@ sync_lock = threading.Lock()
 try:
     db_pool = psycopg2.pool.ThreadedConnectionPool(1, 10, DATABASE_URL, sslmode='require', connect_timeout=15)
 except Exception as e:
-    logger.critical(f"Database Pool Error: {e}")
+    logger.critical(f"❌ DB Pool Error: {e}")
 
 def get_hash(text):
     clean = "".join(re.sub(r'[^\w]', '', text).split())
@@ -39,36 +39,34 @@ def get_hash(text):
 
 def ai_curator(text, province):
     if not GEMINI_API_KEY: return None
-    prompt = f"سردبیر {province} باش. متن را در یکی از دسته‌ها بگذار و تیتر ۶ کلمه‌ای بساز. فقط JSON: {{\"category\": \"...\", \"title\": \"...\"}}. اگر مربوط نیست NO. لیست: {','.join(HUB_CATEGORIES)}. متن: {text[:500]}"
+    prompt = f"سردبیر {province} باش. متن را تحلیل کن. اگر مربوط نیست NO. وگرنه خروجی JSON: {{\"category\": \"...\", \"title\": \"...\"}}. لیست: {','.join(HUB_CATEGORIES)}. متن: {text[:500]}"
     
-    # پچ فنی V59: غیرفعال کردن تمام فیلترهای امنیتی گوگل برای عبور اخبار
-    safety_settings = [
-        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
-    ]
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "safetySettings": [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
+        ],
+        "generationConfig": {"responseMimeType": "application/json"}
+    }
     
     try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "safetySettings": safety_settings,
-            "generationConfig": {"responseMimeType": "application/json"}
-        }
-        r = requests.post(url, json=payload, timeout=15)
+        # وقفه ۴ ثانیه‌ای برای رعایت Rate Limit گوگل (بسیار مهم)
+        time.sleep(4)
+        r = requests.post(url, json=payload, timeout=20)
         data = r.json()
         
-        # بررسی وجود کاندیدا (جلوگیری از خطای قبلی)
-        if 'candidates' not in data:
-            logger.error(f"⚠️ Gemini Blocked or Error: {data.get('promptFeedback', 'Unknown Reason')}")
+        if 'candidates' in data:
+            res_text = data['candidates'][0]['content']['parts'][0]['text']
+            if "NO" in res_text.upper(): return None
+            return json.loads(res_text)
+        else:
+            logger.error(f"⚠️ Gemini API Error: {json.dumps(data)}")
             return None
-            
-        res_text = data['candidates'][0]['content']['parts'][0]['text']
-        if "NO" in res_text.upper(): return None
-        return json.loads(res_text)
     except Exception as e:
-        logger.error(f"AI Gemini Error: {e}")
+        logger.error(f"❌ Gemini Request Failed: {e}")
         return None
 
 def scrape_tg(username):
@@ -80,7 +78,7 @@ def scrape_tg(username):
         soup = BeautifulSoup(resp.text, 'html.parser')
         msgs = soup.find_all("div", class_="tgme_widget_message_wrap")
         now_utc = datetime.now(timezone.utc)
-        for w in reversed(msgs):
+        for w in msgs:
             try:
                 m = w.find("div", class_="tgme_widget_message")
                 t_tag = w.find("time")
@@ -90,31 +88,32 @@ def scrape_tg(username):
                 txt_div = m.find("div", class_="tgme_widget_message_text")
                 body = txt_div.get_text(separator="\n").strip() if txt_div else ""
                 if not body: continue
+                
                 media, m_type = None, "text"
                 v = m.find('video')
                 if v: media, m_type = v.get('src'), "video"
                 else:
                     ph = m.find('a', class_='tgme_widget_message_photo_wrap')
                     if ph:
-                        match = re.search(r"url\('([^']+)'\)", ph.get('style', ''))
+                        st = ph.get('style', '')
+                        match = re.search(r"url\('([^']+)'\)", st)
                         if match: media, m_type = match.group(1), "photo"
                 posts.append({"text": body, "media": media, "type": m_type, "id": m.get("data-post")})
             except: continue
     except: pass
     return posts
 
-def run_v59_engine():
+def run_v60_engine():
     if not sync_lock.acquire(blocking=False): return
     try:
-        logger.info("🎬 --- ENGINE START V59 ---")
+        logger.info("🎬 --- OSINT ENGINE START V60 ---")
         conn = db_pool.getconn()
         with conn.cursor() as cur:
-            cur.execute("CREATE TABLE IF NOT EXISTS seen_v59 (hash TEXT PRIMARY KEY, ts TIMESTAMP DEFAULT NOW())")
+            cur.execute("CREATE TABLE IF NOT EXISTS seen_v60 (hash TEXT PRIMARY KEY, ts TIMESTAMP DEFAULT NOW())")
             conn.commit()
         db_pool.putconn(conn)
 
         for p_id, config in PROVINCES.items():
-            logger.info(f"🔎 Scanning: {config['name']}")
             for src in config['tg']:
                 all_found = scrape_tg(src)
                 for p in all_found:
@@ -122,21 +121,21 @@ def run_v59_engine():
                     conn = db_pool.getconn()
                     try:
                         with conn.cursor() as cur:
-                            cur.execute("SELECT 1 FROM seen_v59 WHERE hash = %s", (h,))
+                            cur.execute("SELECT 1 FROM seen_v60 WHERE hash = %s", (h,))
                             if cur.fetchone():
                                 db_pool.putconn(conn); continue
                         
-                        logger.info(f"📝 Analyzing: {p['id']}")
+                        logger.info(f"📝 Analyzing: {p['id']} from @{src}")
                         ai_res = ai_curator(p['text'], config['name'])
                         
                         if not ai_res:
                             with conn.cursor() as cur:
-                                cur.execute("INSERT INTO seen_v59 VALUES (%s) ON CONFLICT DO NOTHING", (h,))
+                                cur.execute("INSERT INTO seen_v60 VALUES (%s) ON CONFLICT DO NOTHING", (h,))
                                 conn.commit()
                             db_pool.putconn(conn); continue
                         
-                        source_url = f"https://t.me/{p['id']}"
-                        cap = f"<b>{ai_res.get('category')}</b>\n📌 <b>{ai_res.get('title')}</b>\n\n{p['text'][:850]}\n\n🔗 <a href='{source_url}'>منبع</a>"
+                        # ارسال به تلگرام
+                        cap = f"<b>{ai_res.get('category')}</b>\n📌 <b>{ai_res.get('title')}</b>\n\n{p['text'][:850]}\n\n🔗 <a href='https://t.me/{p['id']}'>منبع</a>"
                         tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/"
                         sent = False
                         
@@ -155,13 +154,12 @@ def run_v59_engine():
                             requests.post(tg_url + "sendMessage", json={"chat_id": config['channel'], "text": cap, "parse_mode": "HTML"}, timeout=15)
                         
                         with conn.cursor() as cur:
-                            cur.execute("INSERT INTO seen_v59 (hash) VALUES (%s) ON CONFLICT DO NOTHING", (h,))
+                            cur.execute("INSERT INTO seen_v60 (hash) VALUES (%s) ON CONFLICT DO NOTHING", (h,))
                             conn.commit()
                         db_pool.putconn(conn)
-                        logger.info(f"✅ SUCCESS: {p['id']}")
-                        time.sleep(2)
+                        logger.info(f"✅ DISPATCHED: {p['id']}")
                     except Exception as e:
-                        logger.error(f"Post error: {e}")
+                        logger.error(f"Error: {e}")
                         db_pool.putconn(conn)
     finally:
         sync_lock.release()
@@ -169,9 +167,9 @@ def run_v59_engine():
 
 @app.route('/')
 @app.route('/check')
-def manual_trigger():
-    threading.Thread(target=run_v59_engine).start()
-    return "V59 ACTIVE", 200
+def check():
+    threading.Thread(target=run_v60_engine).start()
+    return "OK", 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
