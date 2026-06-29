@@ -7,14 +7,13 @@ from urllib.parse import quote
 
 # پیکربندی لاگ حرفه‌ای
 logging.basicConfig(level=logging.INFO, stream=sys.stdout, format='%(asctime)s [%(levelname)s] %(message)s')
-logger = logging.getLogger("OSINT_V51_FINAL")
+logger = logging.getLogger("OSINT_V52_STABLE")
 
 # تنظیمات اصلی
 BOT_TOKEN = "8842107952:AAFszVHNfL331IRN1YWIi6hP9QTY4o3vhxk"
 DATABASE_URL = os.environ.get("DATABASE_URL")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-# ۱۱ موضوع استراتژیک
 HUB_CATEGORIES = [
     "۱. 🚨 اعتراضات و مطالبات", "۲. ⚖️ حقوق بشر و امنیتی", "۳. 🚧 خدمات شهری و زیرساخت",
     "۴. 💰 معیشت و بازار", "۵. 🏥 دارو و سلامت", "۶. 🌦 هواشناسی و جاده",
@@ -25,45 +24,70 @@ HUB_CATEGORIES = [
 PROVINCES = {
     "hormozgan": {
         "name": "هرمزگان و بندرعباس", "channel": "-1003915149928",
-        "tg": ["hormozgan_online", "bndonline", "bandarabbasnews", "akhbar_hormozgan", "hormozgan_today"]
+        "tg": ["hormozgan_online", "bndonline", "bandarabbasnews", "akhbar_hormozgan", "hormozgan_today", "bandar_news", "bnd_wall"]
     },
     "fars": {
         "name": "فارس و شیراز", "channel": "-1004352884396",
-        "tg": ["shiraz_news", "akhbarfars", "YeRoozeShiraz", "shiraz_online", "Shiraz_Fouri"]
+        "tg": ["akhbarfars", "shiraz_news", "YeRoozeShiraz", "FouriFars", "shiraz_online", "shiraz_ma", "sums1401", "shiraz_news24", "Shiraz_Fouri"]
     }
 }
 
 app = Flask(__name__)
-sync_lock = threading.Lock() # جلوگیری از تداخل اجرا
+sync_lock = threading.Lock()
 
-# پچ فنی ۱: سیستم اتصال پایدار
+# پچ فنی: Connection Pool
 try:
-    db_pool = psycopg2.pool.ThreadedConnectionPool(1, 15, DATABASE_URL, sslmode='require', connect_timeout=10)
-    logger.info("✅ Database Pool Initialized.")
+    db_pool = psycopg2.pool.ThreadedConnectionPool(1, 20, DATABASE_URL, sslmode='require', connect_timeout=15)
 except Exception as e:
-    logger.critical(f"❌ DB Pool Critical Failure: {e}")
+    logger.critical(f"DB Pool Initialization Error: {e}")
 
-def get_content_hash(text):
-    if not text: return None
-    clean = "".join(re.sub(r'[^\w]', '', text).split())
-    return hashlib.md5(clean.encode('utf-8')).hexdigest()
+def with_db_retry(retries=3):
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            for i in range(retries + 1):
+                try: return func(*args, **kwargs)
+                except:
+                    if i == retries: return None
+                    time.sleep(2)
+            return None
+        return wrapper
+    return decorator
 
-def ai_process(text, province):
-    """تحلیل محتوا با متد JSON Mode"""
+@with_db_retry()
+def is_seen(h):
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM seen_v48 WHERE hash = %s", (h,))
+            return cur.fetchone() is not None
+    finally: db_pool.putconn(conn)
+
+@with_db_retry()
+def mark_seen(h):
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO seen_v48 (hash) VALUES (%s) ON CONFLICT DO NOTHING", (h,))
+            conn.commit()
+    finally: db_pool.putconn(conn)
+
+# اصلاح باگ نام‌گذاری: تغییر نام به ai_analyze برای هماهنگی با بدنه کد
+def ai_analyze(text, province):
     if not GEMINI_API_KEY: return None
-    prompt = f"سردبیر {province} باش. اگر خبر مربوط نیست فقط NO برگردان. وگرنه خروجی JSON: {{\"category\": \"...\", \"title\": \"...\"}}. لیست: {','.join(HUB_CATEGORIES)}. متن: {text[:500]}"
+    prompt = f"تحلیلگر {province} باش. اگر خبر مربوط نیست فقط NO برگردان. وگرنه JSON: {{\"category\": \"...\", \"title\": \"...\"}}. لیست: {','.join(HUB_CATEGORIES)}. متن: {text[:500]}"
     try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
         r = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"responseMimeType": "application/json"}}, timeout=12)
         res = r.json()['candidates'][0]['content']['parts'][0]['text']
-        return None if "NO" in res.upper() else json.loads(res)
+        if "NO" in res.upper(): return None
+        return json.loads(res)
     except: return None
 
 def scrape_telegram(user):
     items = []
     try:
         url = f"https://t.me/s/{user}"
-        resp = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+        resp = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
         if resp.status_code != 200: return items
         soup = BeautifulSoup(resp.text, 'html.parser')
         msgs = soup.find_all("div", class_="tgme_widget_message_wrap")
@@ -74,7 +98,7 @@ def scrape_telegram(user):
                 t_tag = w.find("time")
                 if not m or not t_tag: continue
                 dt = datetime.fromisoformat(t_tag.get("datetime").replace('Z', '+00:00'))
-                if now_utc - dt > timedelta(hours=24): continue # فیلتر ۲۴ ساعته
+                if now_utc - dt > timedelta(hours=24): continue
                 
                 post_id = m.get("data-post")
                 body = m.find("div", class_="tgme_widget_message_text").get_text(separator="\n").strip() if m.find("div", class_="tgme_widget_message_text") else ""
@@ -85,7 +109,7 @@ def scrape_telegram(user):
                 if v: media, m_type = v.get('src'), "video"
                 else:
                     ph = m.find('a', class_='tgme_widget_message_photo_wrap')
-                    if ph:
+                    if ph: 
                         match = re.search(r"url\('([^']+)'\)", ph.get('style', ''))
                         if match: media, m_type = match.group(1), "photo"
                 
@@ -94,79 +118,66 @@ def scrape_telegram(user):
     except: pass
     return items
 
-def run_osint_engine():
-    if not sync_lock.acquire(blocking=False):
-        logger.warning("🚫 Sync already in progress. Skipping.")
-        return
+def run_v52_engine():
+    if not sync_lock.acquire(blocking=False): return
     
     try:
-        logger.info("🚀 OSINT PIPELINE STARTED")
+        logger.info("🎬 [ENGINE START] - Scanning all nodes...")
+        
+        # تضمین دیتابیس
         conn = db_pool.getconn()
-        with conn:
+        try:
             with conn.cursor() as cur:
-                cur.execute("CREATE TABLE IF NOT EXISTS seen_v51 (hash TEXT PRIMARY KEY, ts TIMESTAMP DEFAULT NOW())")
-        db_pool.putconn(conn)
+                cur.execute("CREATE TABLE IF NOT EXISTS seen_v48 (hash TEXT PRIMARY KEY, ts TIMESTAMP DEFAULT NOW())")
+                conn.commit()
+        finally: db_pool.putconn(conn)
 
         for p_id, config in PROVINCES.items():
-            logger.info(f"🔎 Scanning: {config['name']}")
             for src in config['tg']:
                 posts = scrape_telegram(src)
                 for p in posts:
-                    h = get_content_hash(p['text'])
+                    # تولید هش محتوایی برای جلوگیری از تکرار (بند ۴ توافق)
+                    clean_content = "".join(re.sub(r'[^\w]', '', p['text'][:60]).split())
+                    h = hashlib.md5(clean_content.encode('utf-8')).hexdigest()
                     
-                    conn = db_pool.getconn()
-                    try:
-                        with conn.cursor() as cur:
-                            cur.execute("SELECT 1 FROM seen_v51 WHERE hash = %s", (h,))
-                            if cur.fetchone(): 
-                                db_pool.putconn(conn); continue
-                        
-                        ai_res = ai_analyze(p['text'], config['name'])
-                        if not ai_res: # خبر رد شده یا بی ربط
-                            with conn.cursor() as cur:
-                                cur.execute("INSERT INTO seen_v51 VALUES (%s) ON CONFLICT DO NOTHING", (h,))
-                            conn.commit()
-                            db_pool.putconn(conn); continue
-                        
-                        # آماده سازی کپشن
-                        source_url = f"https://t.me/{p['id']}"
-                        cap = f"<b>{ai_res.get('category')}</b>\n📌 <b>{ai_res.get('title')}</b>\n\n{p['text'][:850]}\n\n🔗 <a href='{source_url}'>منبع</a>"
-                        
-                        # ارسال مدیا (استریمینگ)
-                        tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/"
-                        sent = False
-                        if p['media']:
-                            try:
-                                with requests.get(p['media'], stream=True, timeout=30) as r_stream:
-                                    bio = io.BytesIO()
-                                    for chunk in r_stream.iter_content(chunk_size=16384): bio.write(chunk)
-                                    bio.seek(0)
-                                    method = "sendVideo" if p['type'] == "video" else "sendPhoto"
-                                    bio.name = "file.mp4" if p['type'] == "video" else "file.jpg"
-                                    requests.post(tg_url + method, data={"chat_id": config['channel'], "caption": cap, "parse_mode": "HTML"}, files={p['type']: bio}, timeout=45)
-                                    sent = True
-                            except: pass
-                        
-                        if not sent:
-                            requests.post(tg_url + "sendMessage", json={"chat_id": config['channel'], "text": cap, "parse_mode": "HTML"}, timeout=20)
-                        
-                        with conn.cursor() as cur:
-                            cur.execute("INSERT INTO seen_v51 VALUES (%s) ON CONFLICT DO NOTHING", (h,))
-                        conn.commit()
-                        db_pool.putconn(conn)
-                        logger.info(f"✅ Dispatched: {p['id']}")
-                        time.sleep(2)
-                    except Exception as e:
-                        logger.error(f"Post error: {e}")
-                        db_pool.putconn(conn)
+                    if is_seen(h): continue
+                    
+                    ai_res = ai_analyze(p['text'], config['name'])
+                    if not ai_res: # پچ استراتژیک: مارک کردن اخبار رد شده
+                        mark_seen(h); continue
+                    
+                    source_url = f"https://t.me/{p['id']}"
+                    safe_cap = f"<b>{ai_res.get('category','۱۱. عمومی')}</b>\n📌 <b>{ai_res.get('title','گزارش')}</b>\n\n{p['text'][:850]}\n\n🔗 <a href='{source_url}'>منبع</a>"
+                    
+                    tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/"
+                    sent = False
+                    
+                    if p['media']:
+                        try:
+                            with requests.get(p['media'], stream=True) as r_stream:
+                                bio = io.BytesIO()
+                                for chunk in r_stream.iter_content(chunk_size=16384): bio.write(chunk)
+                                bio.seek(0)
+                                method = "sendVideo" if p['type'] == "video" else "sendPhoto"
+                                bio.name = "file.mp4" if p['type'] == "video" else "file.jpg"
+                                r = requests.post(tg_url + method, data={"chat_id": config['channel'], "caption": safe_cap, "parse_mode": "HTML"}, files={p['type']: bio}, timeout=45)
+                                sent = (r.status_code == 200)
+                        except: pass
+                    
+                    if not sent:
+                        r = requests.post(tg_api + "sendMessage", json={"chat_id": config['channel'], "text": safe_cap, "parse_mode": "HTML"}, timeout=15)
+                        sent = (r.status_code == 200)
+                    
+                    if sent: mark_seen(h)
+                    time.sleep(2)
     finally:
         sync_lock.release()
-        logger.info("🏁 OSINT PIPELINE FINISHED")
+        logger.info("🏁 [ENGINE FINISHED]")
 
 @app.route('/check')
 @app.route('/')
 def check():
-    threading.Thread(target=run_osint_engine).start()
+    threading.Thread(target=run_v52_engine).start()
     return "OK", 200
 
 if __name__ == "__main__":
