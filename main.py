@@ -1,35 +1,27 @@
 import os, json, time, psycopg2, hashlib, threading, requests, re, sys, logging, io
 from bs4 import BeautifulSoup
-from flask import Flask, jsonify
+from flask import Flask
 from xml.etree import ElementTree
 from datetime import datetime, timedelta
 
-# تنظیمات لاگ حرفه‌ای
+# تنظیمات لاگ برای رصد دقیق در رندر
 logging.basicConfig(level=logging.INFO, stream=sys.stdout, format='%(asctime)s - %(message)s')
-logger = logging.getLogger("MASTER_OSINT_FINAL")
+logger = logging.getLogger("PRO_V44")
 
-# تنظیمات محیطی
 BOT_TOKEN = "8842107952:AAFszVHNfL331IRN1YWIi6hP9QTY4o3vhxk"
 DATABASE_URL = os.environ.get("DATABASE_URL")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-HUB_CATEGORIES = [
-    "۱. 🚨 اعتراضات و مطالبات مردمی", "۲. ⚖️ حقوق بشر و امنیتی", "۳. 🚧 خدمات شهری و زیرساخت",
-    "۴. 💰 معیشت و کالاهای اساسی", "۵. 🏥 دارو و سلامت", "۶. 🌦 هواشناسی و جاده",
-    "۷. 🎓 مدارس و دانشگاه", "۸. 💼 استخدام و اشتغال", "۹. 🗝 نیازمندی‌ها و دیوار",
-    "۱۰. 🔍 گم‌شده‌ها و پیداشده‌ها", "۱۱. 🎭 فرهنگی، گردشگری و رسم و رسوم"
-]
+HUB_TOPICS = ["اعتراضات", "امنیت", "خدمات شهری", "معیشت", "سلامت", "هواشناسی", "مدارس", "استخدام", "نیازمندی", "گمشده", "فرهنگی"]
 
 PROVINCES = {
     "fars": {
         "name": "فارس و شیراز", "channel": "-1004352884396",
-        "tg": ["akhbarfars", "shiraz_news", "YeRoozeShiraz", "sums1401", "shiraztopnews", "FouriFars", "FarsFouri", "avaye_shiraz", "shiraz_news24", "shiraz_salam", "Shiraz_Fouri"],
-        "search_query": "شیراز OR فارس OR مرودشت OR کازرون OR 'باغ ارم' OR 'تخت جمشید' OR ممسنی"
+        "tg": ["akhbarfars", "shiraz_news", "YeRoozeShiraz", "shiraz_online", "FouriFars"]
     },
     "hormozgan": {
         "name": "هرمزگان و بندرعباس", "channel": "-1003915149928",
-        "tg": ["hormozgan_online", "bndonline", "bandarabbasnews", "akhbar_hormozgan", "hormozgan_today", "bandar_news", "bnd_wall"],
-        "search_query": "بندرعباس OR هرمزگان OR قشم OR کیش OR میناب OR 'بندر لنگه' OR 'مراسم زار'"
+        "tg": ["akhbar_hormozgan", "hormozgan_online", "bndonline", "bandarabbasnews", "hormozgan_today"]
     }
 }
 
@@ -37,53 +29,42 @@ app = Flask(__name__)
 
 def get_db(): return psycopg2.connect(DATABASE_URL, sslmode='require', connect_timeout=15)
 
-def init_db():
-    try:
-        conn = get_db(); cur = conn.cursor()
-        cur.execute("CREATE TABLE IF NOT EXISTS seen_final_v1 (hash TEXT PRIMARY KEY, ts TIMESTAMP DEFAULT NOW())")
-        conn.commit(); cur.close(); conn.close()
-    except: pass
+def clean_text(text):
+    if not text: return ""
+    return text.replace("<", "&lt;").replace(">", "&gt;").replace("&", "&amp;").strip()
 
-def ai_curator(text, province):
-    """هوش مصنوعی با دانش اطلس جغرافیایی و فرهنگی ایران"""
-    if not GEMINI_API_KEY: return HUB_CATEGORIES[10], "گزارش جدید"
-    prompt = f"""تو یک متخصص جغرافیا، فرهنگ و اخبار استان {province} هستی.
-    متن زیر را تحلیل کن. اگر مربوط به محلات، شهرها، رسم و رسوم یا حوادث این استان نیست، بگو NO.
-    اگر هست، از این لیست فقط یک دسته را انتخاب کن: {', '.join(HUB_CATEGORIES)}.
-    همچنین یک تیتر ۵ کلمه‌ای جنجالی بساز.
-    فرمت پاسخ: CATEGORY | TITLE
-    متن: {text[:600]}"""
+def ai_tag(text, province):
+    if not GEMINI_API_KEY: return "۱۱. عمومی"
+    prompt = f"سردبیر {province} باش. از این لیست یک دسته انتخاب کن و یک تیتر ۵ کلمه ای بساز. CAT | TITLE. لیست: {','.join(HUB_TOPICS)}. متن: {text[:400]}"
     try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
-        r = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=12)
-        res = r.json()['candidates'][0]['content']['parts'][0]['text'].strip()
-        if "NO" in res.upper(): return None, None
-        parts = res.split('|')
-        return (parts[0].strip(), parts[1].strip()) if len(parts) > 1 else (HUB_CATEGORIES[10], res)
-    except: return HUB_CATEGORIES[10], "گزارش جدید"
+        r = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=10)
+        return r.json()['candidates'][0]['content']['parts'][0]['text'].strip()
+    except: return "گزارش جدید"
 
-def clean_html(text):
-    """حذف تگ‌های مخرب برای جلوگیری از خطای تلگرام"""
-    return text.replace("<", "&lt;").replace(">", "&gt;").replace("&", "&amp;")
-
-def scrape_tg(user):
-    """رصد تلگرام با فیلتر دقیق ۲۴ ساعته و استخراج مدیا"""
+def scrape_tg_v44(user):
     items = []
     try:
         url = f"https://t.me/s/{user}"
-        soup = BeautifulSoup(requests.get(url, timeout=20, headers={"User-Agent":"Mozilla/5.0"}).text, 'html.parser')
+        resp = requests.get(url, timeout=20, headers={"User-Agent":"Mozilla/5.0"})
+        soup = BeautifulSoup(resp.text, 'html.parser')
         msgs = soup.find_all("div", class_="tgme_widget_message_wrap")
         now = datetime.now()
-        for w in msgs[-15:]:
+        
+        for w in msgs[-30:]: # افزایش عمق به ۳۰ پست برای هرمزگان
             m = w.find("div", class_="tgme_widget_message")
             t_tag = w.find("time")
             if not m or not t_tag: continue
             
-            # فیلتر ۲۴ ساعت واقعی
+            # فیلتر ۲۴ ساعته دقیق
             dt = datetime.fromisoformat(t_tag.get("datetime").replace('Z', '+00:00')).replace(tzinfo=None)
             if now - dt > timedelta(hours=24): continue
 
-            post = {"text": "", "media": None, "type": "text", "id": m.get("data-post"), "link": f"https://t.me/{m.get('data-post')}"}
+            # استفاده از آیدی عددی پست به عنوان شناسه یکتا (بسیار حیاتی)
+            post_id = m.get("data-post") 
+            if not post_id: continue
+
+            post = {"text": "", "media": None, "type": "text", "id": post_id}
             txt_div = m.find("div", class_="tgme_widget_message_text")
             if txt_div: post["text"] = txt_div.get_text(separator="\n").strip()
             
@@ -94,62 +75,61 @@ def scrape_tg(user):
                 if ph:
                     match = re.search(r"url\('([^']+)'\)", ph.get('style', ''))
                     if match: post["media"] = match.group(1); post["type"] = "photo"
+            
             if post["text"]: items.append(post)
-    except: pass
+    except Exception as e: logger.error(f"Scrape error @{user}: {e}")
     return items
 
-def run_osint_engine():
-    init_db()
-    for p_id, config in PROVINCES.items():
-        logger.info(f"--- 📡 SCANNING {config['name'].upper()} ---")
-        pool = []
-        # ۱. منابع اختصاصی تلگرام
-        for src in config['tg']: pool.extend(scrape_tg(src))
-        
-        # ۲. جستجوی سراسری (وب و اجتماعی)
-        try:
-            from urllib.parse import quote
-            g_url = f"https://news.google.com/rss/search?q={quote(config['search_query'])}+when:1d&hl=fa&gl=IR&ceid=IR:fa"
-            root = ElementTree.fromstring(requests.get(g_url, timeout=15).content)
-            for i in root.findall(".//item")[:10]:
-                pool.append({"text": i.findtext("title"), "link": i.findtext("link"), "type": "text", "media": None, "id": i.findtext("link")})
-        except: pass
+def run_sync():
+    # تضمین وجود جدول جدید
+    try:
+        conn = get_db(); cur = conn.cursor()
+        cur.execute("CREATE TABLE IF NOT EXISTS seen_v44 (hash TEXT PRIMARY KEY, ts TIMESTAMP DEFAULT NOW())")
+        conn.commit(); cur.close(); conn.close()
+    except: pass
 
-        for p in pool:
-            # حذف تکراری بر اساس محتوا (بند ۴ توافق)
-            content_hash = hashlib.md5(re.sub(r'\s+', '', p['text'][:60]).encode()).hexdigest()
-            conn = get_db(); cur = conn.cursor()
-            cur.execute("SELECT 1 FROM seen_final_v1 WHERE hash = %s", (content_hash,))
-            if not cur.fetchone():
-                cat, title = ai_curator(p['text'], config['name'])
-                if cat:
-                    cap = f"<b>{clean_html(cat)}</b>\n📌 <b>{clean_html(title)}</b>\n\n{clean_html(p['text'][:850])}\n\n🔗 <a href='{p['link']}'>منبع خبر</a>"
+    for p_id, config in PROVINCES.items():
+        logger.info(f"--- 📡 SCANNING {config['name']} ---")
+        for src in config['tg']:
+            posts = scrape_tg_v44(src)
+            for p in posts:
+                # شناسایی بر اساس آیدی پست (تضمین دریافت تمام اخبار)
+                h = hashlib.md5(str(p['id']).encode()).hexdigest()
+                
+                conn = get_db(); cur = conn.cursor()
+                cur.execute("SELECT 1 FROM seen_v44 WHERE hash = %s", (h,))
+                if not cur.fetchone():
+                    res = ai_tag(p['text'], config['name'])
+                    cap = f"<b>{clean_text(res)}</b>\n📍 استان {config['name']}\n\n{clean_text(p['text'][:850])}\n\n🔗 <a href='https://t.me/{p['id']}'>منبع اصلی</a>"
+                    
                     try:
                         tg_api = f"https://api.telegram.org/bot{BOT_TOKEN}/"
-                        res = None
-                        if p['type'] != "text" and p['media']:
-                            m_data = requests.get(p['media'], timeout=25).content
+                        sent = False
+                        if p['media']:
+                            m_data = requests.get(p['media'], timeout=20).content
                             method = "sendVideo" if p['type'] == "video" else "sendPhoto"
-                            res = requests.post(tg_api+method, data={"chat_id":config['channel'], "caption":cap, "parse_mode":"HTML"}, files={p['type']: m_data})
+                            r = requests.post(tg_api+method, data={"chat_id":config['channel'], "caption":cap, "parse_mode":"HTML"}, files={p['type']: m_data})
+                            sent = r.status_code == 200
                         
-                        if not res or res.status_code != 200:
-                            res = requests.post(tg_api+"sendMessage", json={"chat_id":config['channel'], "text":cap, "parse_mode":"HTML"})
-                        
-                        if res.status_code == 200:
-                            cur.execute("INSERT INTO seen_final_v1 (hash) VALUES (%s)", (content_hash,))
+                        if not sent:
+                            r = requests.post(tg_api+"sendMessage", json={"chat_id":config['channel'], "text":cap, "parse_mode":"HTML"})
+                            sent = r.status_code == 200
+
+                        if sent:
+                            cur.execute("INSERT INTO seen_v44 (hash) VALUES (%s)", (h,))
                             conn.commit()
+                            logger.info(f"✅ SUCCESS: {p['id']}")
                     except: pass
-            cur.close(); conn.close()
-            time.sleep(2)
+                cur.close(); conn.close()
+                time.sleep(2)
 
 @app.route('/check')
 def check():
-    threading.Thread(target=run_osint_engine).start()
+    threading.Thread(target=run_sync).start()
     return "OK"
 
 @app.route('/')
-def home():
-    return "BOT ACTIVE"
+def home(): return "STABLE"
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
