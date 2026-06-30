@@ -1,195 +1,115 @@
-import os, json, time, psycopg2, hashlib, threading, requests, re, sys, logging, io, random
-from psycopg2 import pool
+import os, time, sqlite3, hashlib, requests, re, logging, threading
 from bs4 import BeautifulSoup
 from flask import Flask
-import feedparser  # اضافه شدن فیدپارسر برای خواندن فیدهای واسطه
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
-# لاگینگ حرفه‌ای
-logging.basicConfig(level=logging.INFO, stream=sys.stdout, format='%(asctime)s [%(levelname)s] %(message)s')
-logger = logging.getLogger("OSINT_V61_FINAL")
-
+# تنظیمات به سبک ویکتور
 BOT_TOKEN = "8842107952:AAFszVHNfL331IRN1YWIi6hP9QTY4o3vhxk"
-DATABASE_URL = os.environ.get("DATABASE_URL")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-
-HUB_CATEGORIES = ["۱.اعتراضات", "۲.امنیتی", "۳.خدمات شهری", "۴.معیشت", "۵.سلامت", "۶.هواشناسی", "۷.مدارس", "۸.استخدام", "۹.نیازمندی", "۱۰.گمشده", "۱۱.فرهنگی"]
+FARS_CHANNEL = "-1004352884396"
+BND_CHANNEL = "-1003915149928"
+DB_PATH = "bot_data.db"
 
 PROVINCES = {
-    "hormozgan": {
-        "name": "هرمزگان و بندرعباس", "channel": "-1003915149928",
-        "tg": ["hormozgan_online", "bndonline", "bandarabbasnews", "akhbar_hormozgan", "hormozgan_today"]
-    },
     "fars": {
-        "name": "فارس و شیراز", "channel": "-1004352884396",
-        "tg": ["akhbarfars", "shiraz_news", "YeRoozeShiraz", "shiraz_online", "Shiraz_Fouri"]
+        "channel": FARS_CHANNEL,
+        "sources": ["akhbarfars", "shiraz_news", "YeRoozeShiraz", "FouriFars", "shiraz_online", "shiraz_ma", "sums1401", "shiraz_news24"]
+    },
+    "hormozgan": {
+        "channel": BND_CHANNEL,
+        "sources": ["hormozgan_online", "bndonline", "bandarabbasnews", "akhbar_hormozgan", "hormozgan_today", "bandar_news"]
     }
 }
 
 app = Flask(__name__)
-sync_lock = threading.Lock()
 
-try:
-    db_pool = psycopg2.pool.ThreadedConnectionPool(1, 10, DATABASE_URL, sslmode='require', connect_timeout=15)
-except Exception as e:
-    logger.critical(f"❌ DB Pool Error: {e}")
+def get_db():
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE IF NOT EXISTS seen (hash TEXT PRIMARY KEY, ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+    conn.commit()
+    return conn
 
-def get_hash(text):
-    if not text: return "empty"
-    clean = "".join(re.sub(r'[^\w]', '', text).split())
-    return hashlib.md5(clean.encode('utf-8')).hexdigest()
-
-def ai_curator(text, province):
-    if not GEMINI_API_KEY: return None
-    prompt = f"سردبیر {province} باش. اگر خبر مربوط نیست فقط NO برگردان. وگرنه خروجی JSON: {{\"category\": \"...\", \"title\": \"...\"}}. لیست: {','.join(HUB_CATEGORIES)}. متن: {text[:500]}"
-    url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "safetySettings": [{"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"}, {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"}],
-        "generationConfig": {"responseMimeType": "application/json"}
-    }
+def download_media(url):
+    """متد دانلود مستقیم ویکتور"""
     try:
-        time.sleep(3) # جلوگیری از بلاک شدن توسط گوگل
-        r = requests.post(url, json=payload, timeout=20)
-        data = r.json()
-        if 'candidates' in data:
-            res_text = data['candidates'][0]['content']['parts'][0]['text']
-            if "NO" in res_text.upper(): return None
-            return json.loads(res_text)
-        return None
+        r = requests.get(url, stream=True, timeout=30, headers={"User-Agent":"Mozilla/5.0"})
+        if r.status_code == 200: return r.content
     except: return None
+    return None
 
-def scrape_tg_via_bridge(username):
-    """استفاده از پل واسطه RSS برای دور زدن مسدودی آی‌پی رندر"""
-    posts = []
-    bridges = [
-        f"https://rsshub.app/telegram/channel/{username}",
-        f"https://rss.artemislena.eu.org/telegram/channel/{username}",
-        f"https://rsshub.rss.rocks/telegram/channel/{username}"
-    ]
-    
-    for url in bridges:
-        try:
-            logger.info(f"📡 Requesting Bridge for @{username} via {url[:30]}")
-            feed = feedparser.parse(url)
-            if not feed.entries: continue
-            
-            now_utc = datetime.now(timezone.utc)
-            for entry in feed.entries[:10]:
-                # استخراج پایداری زمان پست
-                pub_parsed = entry.get('published_parsed') or entry.get('updated_parsed')
-                if not pub_parsed: continue
-                
-                pub_date = datetime(*pub_parsed[:6], tzinfo=timezone.utc)
-                if now_utc - pub_date > timedelta(hours=24): continue
-                
-                soup = BeautifulSoup(entry.description, 'html.parser')
-                text = soup.get_text(separator="\n").strip()
-                if not text: continue
-                
-                # استخراج امن لینک رسانه
-                media = None
-                img_tag = soup.find('img')
-                if img_tag: 
-                    src_url = img_tag.get('src')
-                    if src_url and src_url.startswith('http'): media = src_url
-                
-                # استخراج عددی آیدی پست جهت جلوگیری از خرابی لینک منبع
-                post_id = "1"
-                link_to_parse = entry.get('link', '')
-                id_match = re.search(r'/(\d+)(?:\?|$)', link_to_parse)
-                if id_match:
-                    post_id = id_match.group(1)
-                else:
-                    clean_link = link_to_parse.strip('/')
-                    if clean_link: post_id = clean_link.split('/')[-1]
-                
-                posts.append({
-                    "text": text,
-                    "media": media,
-                    "type": "photo" if media else "text",
-                    "id": post_id
-                })
-            
-            if posts: break # اگر محتوا از یک بریج با موفقیت دریافت شد، دیگر سراغ سایر بریج‌ها نرو
-        except Exception as e: 
-            logger.warning(f"⚠️ Bridge {url[:25]} failed for @{username}: {e}")
-            continue
-    return posts
-
-def run_v61_engine():
-    if not sync_lock.acquire(blocking=False): return
+def scrape_tg(user):
+    items = []
     try:
-        logger.info("🎬 --- OSINT ENGINE START V61 (RSS-BRIDGE) ---")
-        conn = db_pool.getconn()
-        with conn.cursor() as cur:
-            cur.execute("CREATE TABLE IF NOT EXISTS seen_v61 (hash TEXT PRIMARY KEY, ts TIMESTAMP DEFAULT NOW())")
-            conn.commit()
-        db_pool.putconn(conn)
+        url = f"https://t.me/s/{user}"
+        resp = requests.get(url, timeout=15, headers={"User-Agent":"Mozilla/5.0"})
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        msgs = soup.find_all("div", class_="tgme_widget_message_wrap")
+        now = datetime.now()
+        for w in reversed(msgs[-15:]):
+            m = w.find("div", class_="tgme_widget_message")
+            t_tag = w.find("time")
+            if not m or not t_tag: continue
+            
+            dt = datetime.fromisoformat(t_tag.get("datetime").replace('Z', '+00:00')).replace(tzinfo=None)
+            if now - dt > timedelta(hours=24): continue # فقط ۲۴ ساعت اخیر
 
-        for p_id, config in PROVINCES.items():
-            for src in config['tg']:
-                all_found = scrape_tg_via_bridge(src)
-                for p in all_found:
-                    h = get_hash(p['text'])
-                    conn = db_pool.getconn()
+            post = {"text": "", "media": None, "type": "text", "id": m.get("data-post")}
+            txt = m.find("div", class_="tgme_widget_message_text")
+            if txt: post["text"] = txt.get_text(separator="\n").strip()
+            
+            # استخراج مدیا به سبک ویکتور
+            v = m.find('video')
+            if v: post["media"] = v.get('src'); post["type"] = "video"
+            else:
+                ph = m.find('a', class_='tgme_widget_message_photo_wrap')
+                if ph:
+                    st = ph.get('style', '')
+                    match = re.search(r"url\('([^']+)'\)", st)
+                    if match: post["media"] = match.group(1); post["type"] = "photo"
+            
+            if post["text"] or post["media"]: items.append(post)
+    except: pass
+    return items
+
+def run_sync():
+    conn = get_db()
+    for p_id, config in PROVINCES.items():
+        for src in config['sources']:
+            posts = scrape_tg(src)
+            for p in posts:
+                # هش محتوایی برای جلوگیری از تکرار (بند ۴ توافق)
+                content_hash = hashlib.md5(re.sub(r'\s+', '', p['text'][:60]).encode()).hexdigest()
+                cur = conn.cursor()
+                cur.execute("SELECT 1 FROM seen WHERE hash = ?", (content_hash,))
+                if not cur.fetchone():
+                    cap = f"📍 <b>استان {p_id.upper()}</b>\n\n{p['text'][:900]}\n\n🔗 <a href='https://t.me/{p['id']}'>منبع خبر</a>"
                     try:
-                        with conn.cursor() as cur:
-                            cur.execute("SELECT 1 FROM seen_v61 WHERE hash = %s", (h,))
-                            if cur.fetchone():
-                                db_pool.putconn(conn); continue
-                        
-                        logger.info(f"📝 Analyzing: {p['id']} from @{src}")
-                        ai_res = ai_curator(p['text'], config['name'])
-                        
-                        # ذخیره هش برای جلوگیری از تکرار تحلیل پردازش‌ها
-                        with conn.cursor() as cur:
-                            cur.execute("INSERT INTO seen_v61 VALUES (%s) ON CONFLICT DO NOTHING", (h,))
-                            conn.commit()
-                        
-                        if not ai_res:
-                            db_pool.putconn(conn); continue
-                        
-                        # ساخت دقیق آدرس پست اصلی تلگرام
-                        if p['id'].startswith('http'):
-                            source_url = p['id']
-                        else:
-                            source_url = f"https://t.me/{src}/{p['id']}"
-
-                        cap = f"<b>{ai_res.get('category')}</b>\n📌 <b>{ai_res.get('title')}</b>\n\n{p['text'][:850]}\n\n🔗 <a href='{source_url}'>منبع</a>"
                         tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/"
-                        
-                        sent = False
+                        res = None
                         if p['media']:
-                            try:
-                                with requests.get(p['media'], stream=True, timeout=15) as r_stream:
-                                    if r_stream.status_code == 200:
-                                        bio = io.BytesIO()
-                                        for chunk in r_stream.iter_content(chunk_size=16384): bio.write(chunk)
-                                        bio.seek(0)
-                                        r = requests.post(tg_url + "sendPhoto", data={"chat_id": config['channel'], "caption": cap, "parse_mode": "HTML"}, files={"photo": ("file.jpg", bio)}, timeout=30)
-                                        sent = (r.status_code == 200)
-                            except Exception as img_err:
-                                logger.warning(f"⚠️ Could not download/send image, falling back to text: {img_err}")
+                            m_data = download_media(p['media'])
+                            if m_data:
+                                method = "sendVideo" if p['type'] == "video" else "sendPhoto"
+                                res = requests.post(tg_url+method, data={"chat_id":config['channel'], "caption":cap, "parse_mode":"HTML"}, files={p['type']: ("file", m_data)})
                         
-                        if not sent:
-                            requests.post(tg_url + "sendMessage", json={"chat_id": config['channel'], "text": cap, "parse_mode": "HTML"}, timeout=15)
-                        
-                        db_pool.putconn(conn)
-                        logger.info(f"✅ SUCCESS: {p['id']} dispatched to {config['name']}")
-                        time.sleep(2)
-                    except Exception as e:
-                        logger.error(f"Error in main dispatcher loop: {e}")
-                        db_pool.putconn(conn)
-    finally:
-        sync_lock.release()
-        logger.info("🏁 --- ENGINE FINISHED ---")
+                        if not res or res.status_code != 200:
+                            res = requests.post(tg_url+"sendMessage", json={"chat_id":config['channel'], "text":cap, "parse_mode":"HTML"})
 
-@app.route('/')
+                        if res.status_code == 200:
+                            cur.execute("INSERT INTO seen (hash) VALUES (?)", (content_hash,))
+                            conn.commit()
+                    except: pass
+                time.sleep(1)
+    conn.close()
+
 @app.route('/check')
 def check():
-    threading.Thread(target=run_v61_engine).start()
-    return "OK", 200
+    threading.Thread(target=run_sync).start()
+    return "OK"
+
+@app.route('/')
+def home(): return "VIKTOR_STABLE_V1"
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
