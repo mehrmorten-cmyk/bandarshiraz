@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 # پیکربندی لاگ حرفه‌ای
 logging.basicConfig(level=logging.INFO, stream=sys.stdout, format='%(asctime)s [%(levelname)s] %(message)s')
-logger = logging.getLogger("OSINT_V60")
+logger = logging.getLogger("OSINT_V60_FIXED")
 
 BOT_TOKEN = "8842107952:AAFszVHNfL331IRN1YWIi6hP9QTY4o3vhxk"
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -41,7 +41,8 @@ def ai_curator(text, province):
     if not GEMINI_API_KEY: return None
     prompt = f"سردبیر {province} باش. متن را تحلیل کن. اگر مربوط نیست NO. وگرنه خروجی JSON: {{\"category\": \"...\", \"title\": \"...\"}}. لیست: {','.join(HUB_CATEGORIES)}. متن: {text[:500]}"
     
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+    # اصلاح آدرس: تغییر v1beta به v1 جهت رفع خطای 404 مدل gemini-1.5-flash
+    url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "safetySettings": [
@@ -53,7 +54,7 @@ def ai_curator(text, province):
     }
     
     try:
-        # وقفه ۴ ثانیه‌ای برای رعایت Rate Limit گوگل (بسیار مهم)
+        # وقفه ۴ ثانیه‌ای برای رعایت Rate Limit گوگل
         time.sleep(4)
         r = requests.post(url, json=payload, timeout=20)
         data = r.json()
@@ -106,7 +107,7 @@ def scrape_tg(username):
 def run_v60_engine():
     if not sync_lock.acquire(blocking=False): return
     try:
-        logger.info("🎬 --- OSINT ENGINE START V60 ---")
+        logger.info("🎬 --- OSINT ENGINE START V60 (FIXED) ---")
         conn = db_pool.getconn()
         with conn.cursor() as cur:
             cur.execute("CREATE TABLE IF NOT EXISTS seen_v60 (hash TEXT PRIMARY KEY, ts TIMESTAMP DEFAULT NOW())")
