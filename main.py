@@ -45,8 +45,8 @@ FARS_CHANNEL = os.environ.get("FARS_CHANNEL_ID", "")
 BND_CHANNEL = os.environ.get("BND_CHANNEL_ID", "")
 ADMIN_USER_ID = os.environ.get("ADMIN_USER_ID", "")
 
-CHECK_INTERVAL_DEFAULT = 180  # ثانیه (۳ دقیقه)
-WEB_CHECK_INTERVAL = 300      # ثانیه (۵ دقیقه)
+CHECK_INTERVAL_DEFAULT = 1800  # ثانیه (۳۰ دقیقه)
+WEB_CHECK_INTERVAL = 1800     # ثانیه (۳۰ دقیقه)
 DB_PATH = "nabz_data.db"
 MAX_TEXT_LENGTH = 4000
 MAX_CAPTION_LENGTH = 1024
@@ -54,14 +54,20 @@ MAX_POST_AGE_HOURS = 24  # فقط پست‌های ۲۴ ساعت اخیر
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# منابع پیش‌فرض استانی
+# منابع پیش‌فرض استانی (مستقیم فوروارد)
 DEFAULT_PROVINCES = {
     "fars": {
         "channel": FARS_CHANNEL,
         "label": "فارس",
         "sources": [
+            # --- اخبار محلی فارس/شیراز ---
             "akhbarfars", "shiraz_news", "YeRoozeShiraz", "FouriFars",
-            "shiraz_online", "shiraz_ma", "sums1401", "shiraz_news24"
+            "FarsFouri", "avaye_shiraz", "shiraz_online", "shiraz_ma",
+            "sums1401", "shiraz_news24", "shiraztopnews", "shirazu_twitter",
+            "shirazu1", "SaberinFars", "SUTimes", "LineFars",
+            "sSADP", "shorasenfi_shirazunii", "Azad_shiraz", "Shiraz_us",
+            "Fars_today", "eghtesadefars", "fars_iau", "News_Neyriz",
+            "Shiraz_Fouri", "farsna", "ostan", "javanmardi77", "manmanoo",
         ],
         "web_sources": []
     },
@@ -70,10 +76,52 @@ DEFAULT_PROVINCES = {
         "label": "هرمزگان",
         "sources": [
             "hormozgan_online", "bndonline", "bandarabbasnews",
-            "akhbar_hormozgan", "hormozgan_today", "bandar_news"
+            "akhbar_hormozgan", "hormozgan_today", "bandar_news",
         ],
         "web_sources": []
     }
+}
+
+# ============================================================
+# منابع ملی — فیلتر کلمه‌کلیدی (اتوماتیک جداسازی فارس/هرمزگان)
+# ============================================================
+
+NATIONAL_SOURCES = [
+    "Tasnimnews", "mehrnews", "isna94", "yjcnewschannel",
+    "EtemadOnline", "entekhab_ir", "khabaronline_ir",
+    "hamshahrinews", "tabnak", "Asriran_press",
+    "qudsonline", "BourseNews", "snntv",
+    "ir_Protests", "farsivoa",
+]
+
+NATIONAL_WEB_SOURCES = [
+    {"feed_url": "https://mojahedin.org/rss/", "name": "مجاهدین", "url": "https://mojahedin.org"},
+    {"feed_url": "https://www.iranntv.com/rss/", "name": "ایران‌ان‌تی‌وی", "url": "https://www.iranntv.com"},
+    {"feed_url": "https://www.hra-news.org/feed/", "name": "فعالان حقوق بشر", "url": "https://www.hra-news.org"},
+]
+
+# کلمات کلیدی برای تشخیص استان — هر خبر ملی که شامل این کلمات باشد فوروارد می‌شود
+# ⚠️ «فارس» به تنهایی نباشد — چون در «خلیج فارس»، «خبرگزاری فارس»، «فارسی» هم هست
+PROVINCE_KEYWORDS = {
+    "fars": [
+        "شیراز", "استان فارس", "مرودشت", "کازرون", "فسا", "جهرم",
+        "نی‌ریز", "نیریز", "داراب", "آباده", "اقلید", "سپیدان",
+        "خرامه", "زرقان", "فیروزآباد", "لامرد", "استهبان", "نورآباد",
+        "ممسنی", "قیروکارزین", "ارسنجان", "بوانات", "خنج", "گراش",
+        "اوز", "سروستان", "کوار", "پاسارگاد", "لارستان",
+        "شورای شهر شیراز", "دانشگاه شیراز", "فرمانداری شیراز",
+        "فرمانداری لار", "شهرداری شیراز", "تختی شیراز",
+    ],
+    "hormozgan": [
+        "بندرعباس", "بندر عباس", "هرمزگان", "استان هرمزگان", "قشم", "کیش",
+        "میناب", "بندر لنگه", "بندرلنگه",
+        "حاجی‌آباد", "حاجی آباد", "رودان", "بشاگرد", "جاسک", "سیریک",
+        "ابوموسی", "پارسیان", "بستک", "خمیر",
+        "تنگه هرمز", "جزیره قشم", "جزیره کیش",
+        "فرمانداری بندرعباس", "فرمانداری بندر عباس",
+        "شهرداری بندرعباس", "شهرداری بندر عباس",
+        "دانشگاه هرمزگان",
+    ]
 }
 
 SCRAPE_HEADERS = {
@@ -610,6 +658,12 @@ def make_content_hash(channel, text, post_id):
     return hashlib.md5(raw.encode()).hexdigest()
 
 
+def make_text_hash(text):
+    """Create text-only hash for cross-channel dedup (same news from multiple channels)."""
+    cleaned = re.sub(r'\s+', '', text[:200]).strip()
+    return hashlib.md5(f"txt_{cleaned}".encode()).hexdigest()
+
+
 def format_post(post, province_label, for_caption=False):
     """Format a scraped post for forwarding."""
     parts = []
@@ -679,6 +733,24 @@ def forward_post(post, channel_id, province_label):
 
 
 # ============================================================
+# Province Detection (keyword filter for national sources)
+# ============================================================
+
+
+def detect_provinces(text):
+    """Detect which provinces a text is about based on keywords.
+    Returns list of province IDs, e.g. ["fars"], ["hormozgan"], or ["fars", "hormozgan"].
+    """
+    if not text:
+        return []
+    matched = []
+    for pid, keywords in PROVINCE_KEYWORDS.items():
+        if any(kw in text for kw in keywords):
+            matched.append(pid)
+    return matched
+
+
+# ============================================================
 # Main Scraper Loop
 # ============================================================
 
@@ -714,20 +786,34 @@ def check_all_channels():
                 if is_seen(content_hash):
                     continue
 
-                # Keyword filter
+                # بررسی کلمات کلیدی استان — فقط پست‌هایی که مربوط به این استان هستند
+                text = post.get("text", "")
+                matched = detect_provinces(text)
+                if not matched or pid not in matched:
+                    mark_seen(content_hash, pid, source, post["id"])
+                    continue
+
+                # Keyword filter (user-defined)
                 filters = get_setting("filters", "").strip()
                 if filters:
                     filter_list = [f.strip().lower() for f in filters.split(",") if f.strip()]
-                    post_text = post.get("text", "").lower()
+                    post_text = text.lower()
                     if filter_list and post_text and not any(kw in post_text for kw in filter_list):
                         mark_seen(content_hash, pid, source, post["id"])
                         continue
 
-                print(f"[NEW] {label}/@{source}/{post['id']}: {post['text'][:50]}...")
+                # Cross-channel dedup: skip if same text already sent to this province
+                txt_hash = f"{pid}_{make_text_hash(text)}"
+                if is_seen(txt_hash):
+                    mark_seen(content_hash, pid, source, post["id"])
+                    continue
+
+                print(f"[NEW] {label}/@{source}/{post['id']}: {text[:50]}...")
                 success = forward_post(post, channel_id, label)
 
                 if success:
                     mark_seen(content_hash, pid, source, post["id"])
+                    mark_seen(txt_hash, pid, source, post["id"])
                     total_new += 1
                     time.sleep(1.5)
                 else:
@@ -739,6 +825,145 @@ def check_all_channels():
     cleanup_old_records(days=7)
 
 
+def check_national_channels():
+    """Check national sources and route to provinces by keyword."""
+    provinces = get_provinces()
+    paused = get_setting("paused", "0") == "1"
+    if paused:
+        return
+
+    total_new = 0
+
+    for source in NATIONAL_SOURCES:
+        print(f"[NATIONAL] @{source}...")
+        posts = scrape_channel(source)
+
+        if not posts:
+            continue
+
+        for post in posts:
+            text = post.get("text", "")
+            matched_provinces = detect_provinces(text)
+
+            if not matched_provinces:
+                # No province match — skip
+                continue
+
+            base_hash = make_content_hash(source, text, post["id"])
+
+            for pid in matched_provinces:
+                if pid not in provinces:
+                    continue
+                pdata = provinces[pid]
+                channel_id = pdata["channel"]
+                if not channel_id:
+                    continue
+
+                # Province-specific hash so same post can go to both channels
+                nat_hash = f"nat_{pid}_{base_hash}"
+
+                if is_seen(nat_hash):
+                    continue
+
+                # Cross-channel dedup: skip if same text already sent to this province
+                txt_hash = f"{pid}_{make_text_hash(text)}"
+                if is_seen(txt_hash):
+                    mark_seen(nat_hash, pid, source, post["id"])
+                    continue
+
+                label = pdata["label"]
+                print(f"[NATIONAL→{label}] @{source}/{post['id']}: {text[:50]}...")
+                success = forward_post(post, channel_id, f"{label} (ملی)")
+
+                if success:
+                    mark_seen(nat_hash, pid, source, post["id"])
+                    mark_seen(txt_hash, pid, source, post["id"])
+                    total_new += 1
+                    time.sleep(1.5)
+                else:
+                    print(f"[ERROR] Failed national: @{source}/{post['id']}")
+
+    if total_new:
+        print(f"[NATIONAL] {total_new} new posts routed.")
+
+
+def check_national_web_sources():
+    """Check national web/RSS sources and route by keyword."""
+    provinces = get_provinces()
+    if get_setting("web_paused", "0") == "1":
+        return
+
+    total_new = 0
+
+    for ws in NATIONAL_WEB_SOURCES:
+        feed_url = ws["feed_url"]
+        name = ws["name"]
+        print(f"[NATIONAL WEB] {name}...")
+
+        try:
+            feed = feedparser.parse(feed_url)
+            if feed.bozo and not feed.entries:
+                continue
+        except:
+            continue
+
+        for entry in feed.entries:
+            link = entry.get("link", "")
+            if not link:
+                continue
+
+            title = strip_html(entry.get("title", "")).strip()
+            description = strip_html(entry.get("summary", "") or entry.get("description", ""))
+            full_text = f"{title} {description}"
+
+            matched_provinces = detect_provinces(full_text)
+            if not matched_provinces:
+                continue
+
+            for pid in matched_provinces:
+                if pid not in provinces:
+                    continue
+                pdata = provinces[pid]
+                channel_id = pdata["channel"]
+                if not channel_id:
+                    continue
+                label = pdata["label"]
+
+                nat_url = f"nat_{pid}_{link}"
+                if is_web_seen(nat_url):
+                    continue
+
+                pub_date = ""
+                if hasattr(entry, "published"):
+                    try:
+                        import email.utils
+                        dt = email.utils.parsedate_to_datetime(entry.published)
+                        pub_date = dt.strftime("%Y-%m-%d %H:%M")
+                    except:
+                        pub_date = entry.get("published", "")[:16]
+
+                caption = format_web_post(f"{label} (ملی)", name, title,
+                                          entry.get("summary", ""), pub_date, link)
+
+                img_url = find_article_image(link)
+                sent = False
+                if img_url:
+                    result = send_photo_upload(channel_id, img_url, caption)
+                    if result.get("ok"):
+                        sent = True
+                if not sent:
+                    result = send_message(channel_id, caption, disable_preview=False)
+                    sent = result.get("ok", False)
+
+                if sent:
+                    mark_web_seen(nat_url, pid, name)
+                    total_new += 1
+                    time.sleep(2)
+
+    if total_new:
+        print(f"[NATIONAL WEB] {total_new} articles routed.")
+
+
 def scraper_loop():
     """Background loop for channel checking."""
     print("[SCRAPER] Starting...")
@@ -747,6 +972,7 @@ def scraper_loop():
     while True:
         try:
             check_all_channels()
+            check_national_channels()
         except Exception as e:
             print(f"[SCRAPER ERROR] {e}")
             traceback.print_exc()
@@ -880,6 +1106,7 @@ def web_scraper_loop():
     while True:
         try:
             check_all_web_sources()
+            check_national_web_sources()
         except Exception as e:
             print(f"[WEB ERROR] {e}")
             traceback.print_exc()
@@ -1302,36 +1529,69 @@ def check_endpoint():
 
 
 # ============================================================
-# Main
+# Initialization — runs on import (Render/gunicorn compatible)
+# ============================================================
+
+_initialized = False
+_init_lock = threading.Lock()
+
+
+def ensure_init():
+    """Initialize DB and start background threads (once)."""
+    global _initialized
+    if _initialized:
+        return
+    with _init_lock:
+        if _initialized:
+            return
+
+        if not BOT_TOKEN:
+            print("⚠️ TELEGRAM_BOT_TOKEN not set!")
+            return
+
+        # Initialize database
+        init_db()
+
+        print("=" * 50)
+        print("🤖 NABZ — نبض خبری")
+        print("=" * 50)
+
+        provinces = get_provinces()
+        for pid, pdata in provinces.items():
+            print(f"🏷 {pdata['label']}: {len(pdata['sources'])} sources → {pdata['channel']}")
+
+        print(f"📡 ملی: {len(NATIONAL_SOURCES)} کانال TG + {len(NATIONAL_WEB_SOURCES)} وب (فیلتر کلمه‌کلیدی)")
+        print(f"👤 Admin: {ADMIN_USER_ID or 'Not set'}")
+        print(f"⏱ هر {CHECK_INTERVAL_DEFAULT // 60} دقیقه")
+        print("=" * 50)
+
+        # Background threads
+        threading.Thread(target=scraper_loop, daemon=True).start()
+        threading.Thread(target=web_scraper_loop, daemon=True).start()
+        threading.Thread(target=handle_commands, daemon=True).start()
+
+        _initialized = True
+        print("✅ All systems started!")
+
+
+# Auto-initialize on import (for gunicorn / Render)
+ensure_init()
+
+
+# ============================================================
+# Main — for direct execution (Replit / local)
 # ============================================================
 
 
 def main():
+    ensure_init()
+
     if not BOT_TOKEN:
-        print("❌ TELEGRAM_BOT_TOKEN not set! Add to Replit Secrets.")
+        print("❌ TELEGRAM_BOT_TOKEN not set! Add to Secrets/Environment.")
         return
     if not FARS_CHANNEL and not BND_CHANNEL:
         print("❌ At least one channel ID needed! Set FARS_CHANNEL_ID or BND_CHANNEL_ID.")
         return
-
-    # Initialize database
-    init_db()
-
-    print("=" * 50)
-    print("🤖 NABZ — نبض خبری")
-    print("=" * 50)
-
-    provinces = get_provinces()
-    for pid, pdata in provinces.items():
-        print(f"🏷 {pdata['label']}: {len(pdata['sources'])} sources → {pdata['channel']}")
-
-    print(f"👤 Admin: {ADMIN_USER_ID or 'Not set'}")
-    print("=" * 50)
-
-    # Background threads
-    threading.Thread(target=scraper_loop, daemon=True).start()
-    threading.Thread(target=web_scraper_loop, daemon=True).start()
-    threading.Thread(target=handle_commands, daemon=True).start()
 
     # Flask (main thread)
     port = int(os.environ.get("PORT", 5000))
