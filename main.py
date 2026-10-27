@@ -2,7 +2,7 @@
 NABZ — نبض خبری
 ================
 بات تلگرام برای جمع‌آوری اخبار از کانال‌های تلگرام و سایت‌های خبری
-و ارسال به کانال‌های استانی (فارس + هرمزگان).
+و ارسال به کانال‌های استانی (فارس + هرمزگان + بوشهر).
 
 ترکیب بهترین امکانات هر دو پروژه:
 - روتینگ دو کانالی (استانی)
@@ -17,6 +17,7 @@ Environment Variables (Replit Secrets):
 - TELEGRAM_BOT_TOKEN: توکن بات از @BotFather
 - FARS_CHANNEL_ID: آیدی کانال فارس (مثلاً -1004352884396)
 - BND_CHANNEL_ID: آیدی کانال بندرعباس (مثلاً -1003915149928)
+- BUSHEHR_CHANNEL_ID: آیدی کانال بوشهر (مثلاً -1004301618912)
 - ADMIN_USER_ID: آیدی تلگرام ادمین
 """
 
@@ -43,10 +44,12 @@ from flask import Flask
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 FARS_CHANNEL = os.environ.get("FARS_CHANNEL_ID", "")
 BND_CHANNEL = os.environ.get("BND_CHANNEL_ID", "")
+BUSHEHR_CHANNEL = os.environ.get("BUSHEHR_CHANNEL_ID", "-1004301618912")
 ADMIN_USER_ID = os.environ.get("ADMIN_USER_ID", "")
 
 CHECK_INTERVAL_DEFAULT = 1800  # ثانیه (۳۰ دقیقه)
 WEB_CHECK_INTERVAL = 1800     # ثانیه (۳۰ دقیقه)
+SCAN_ONCE = os.environ.get("NABZ_SCAN_ONCE", "0") == "1"
 DB_PATH = "nabz_data.db"
 MAX_TEXT_LENGTH = 4000
 MAX_CAPTION_LENGTH = 1024
@@ -79,6 +82,21 @@ DEFAULT_PROVINCES = {
             "akhbar_hormozgan", "hormozgan_today", "bandar_news",
         ],
         "web_sources": []
+    },
+    "bushehr": {
+        "channel": BUSHEHR_CHANNEL,
+        "label": "بوشهر",
+        "sources": [
+            "VahidOnline", "Akhbarboushehr", "KhalijeFarsOnline",
+            "avabu", "Bushehr_Akhbar",
+        ],
+        "web_sources": [
+            {
+                "feed_url": "https://bushehrnews.ir/feed/",
+                "name": "بوشهر نیوز",
+                "url": "https://bushehrnews.ir"
+            },
+        ]
     }
 }
 
@@ -92,12 +110,20 @@ NATIONAL_SOURCES = [
     "hamshahrinews", "tabnak", "Asriran_press",
     "qudsonline", "BourseNews", "snntv",
     "ir_Protests", "farsivoa",
+    "NW_ZA", "kh_mx", "AzadiMagazine",
 ]
 
 NATIONAL_WEB_SOURCES = [
     {"feed_url": "https://mojahedin.org/rss/", "name": "مجاهدین", "url": "https://mojahedin.org"},
     {"feed_url": "https://www.iranntv.com/rss/", "name": "ایران‌ان‌تی‌وی", "url": "https://www.iranntv.com"},
     {"feed_url": "https://www.hra-news.org/feed/", "name": "فعالان حقوق بشر", "url": "https://www.hra-news.org"},
+    {"feed_url": "https://www.irna.ir/rss", "name": "ایرنا", "url": "https://www.irna.ir"},
+    {"feed_url": "https://www.isna.ir/rss", "name": "ایسنا", "url": "https://www.isna.ir"},
+    {"feed_url": "https://www.mehrnews.com/rss", "name": "مهر", "url": "https://www.mehrnews.com"},
+    {"feed_url": "https://www.khabaronline.ir/rss", "name": "خبرآنلاین", "url": "https://www.khabaronline.ir"},
+    {"feed_url": "https://iranwire.com/feed/", "name": "ایران‌وایر", "url": "https://iranwire.com"},
+    {"feed_url": "https://www.ilna.ir/rss", "name": "ایلنا", "url": "https://www.ilna.ir"},
+    {"feed_url": "https://fa.euronews.com/rss", "name": "یورونیوز فارسی", "url": "https://fa.euronews.com"},
 ]
 
 # کلمات کلیدی برای تشخیص استان — هر خبر ملی که شامل این کلمات باشد فوروارد می‌شود
@@ -121,6 +147,16 @@ PROVINCE_KEYWORDS = {
         "فرمانداری بندرعباس", "فرمانداری بندر عباس",
         "شهرداری بندرعباس", "شهرداری بندر عباس",
         "دانشگاه هرمزگان",
+    ],
+    "bushehr": [
+        "بوشهر", "استان بوشهر", "برازجان", "دشتستان",
+        "کنگان", "عسلویه", "گناوه", "دیلم",
+        "شهرستان دیر", "شهرستان جم", "تنگستان", "دشتی",
+        "خارگ", "جزیره خارگ", "بندر گناوه", "بندرگناوه",
+        "خورموج", "اهرم", "بردخون", "شبانکاره",
+        "نیروگاه اتمی بوشهر", "نیروگاه بوشهر",
+        "فرمانداری بوشهر", "شهرداری بوشهر", "دانشگاه بوشهر",
+        "دانشگاه خلیج فارس",
     ]
 }
 
@@ -737,6 +773,20 @@ def forward_post(post, channel_id, province_label):
 # ============================================================
 
 
+_PERSIAN_LETTER = r'[\u0600-\u06FF]'
+
+
+def _kw_in_text(kw, text):
+    """Check if keyword exists in text.
+    Short keywords (≤3 chars) use word-boundary matching to avoid
+    false positives like «فسا» inside «فساد» or «اوز» inside «تجاوز».
+    """
+    if len(kw) <= 3:
+        pattern = r'(?<!' + _PERSIAN_LETTER + r')' + re.escape(kw) + r'(?!' + _PERSIAN_LETTER + r')'
+        return bool(re.search(pattern, text))
+    return kw in text
+
+
 def detect_provinces(text):
     """Detect which provinces a text is about based on keywords.
     Returns list of province IDs, e.g. ["fars"], ["hormozgan"], or ["fars", "hormozgan"].
@@ -745,7 +795,7 @@ def detect_provinces(text):
         return []
     matched = []
     for pid, keywords in PROVINCE_KEYWORDS.items():
-        if any(kw in text for kw in keywords):
+        if any(_kw_in_text(kw, text) for kw in keywords):
             matched.append(pid)
     return matched
 
@@ -1121,14 +1171,29 @@ def web_scraper_loop():
 def handle_commands():
     """Poll for bot commands."""
     print("[BOT] Starting command handler...")
+
+    # Clear any leftover webhook from old deployments (Render etc.)
+    wb = tg_request("deleteWebhook", drop_pending_updates=False)
+    if wb.get("ok"):
+        print("[BOT] Webhook cleared ✓")
+
     offset = int(get_setting("last_update_id", "0"))
+    conflict_count = 0
 
     while True:
         try:
             result = tg_request("getUpdates", offset=offset + 1, timeout=30)
             if not result.get("ok"):
-                time.sleep(5)
+                desc = result.get("description", "")
+                if "Conflict" in desc:
+                    conflict_count += 1
+                    wait = min(30 * conflict_count, 300)  # backoff: 30s, 60s, ... max 5min
+                    print(f"[BOT] Conflict #{conflict_count}, waiting {wait}s...")
+                    time.sleep(wait)
+                else:
+                    time.sleep(5)
                 continue
+            conflict_count = 0  # reset on success
 
             for update in result.get("result", []):
                 offset = update["update_id"]
@@ -1203,7 +1268,8 @@ def cmd_add(chat_id, text):
                      f"⚠️ <b>استفاده:</b>\n<code>/add &lt;استان&gt; &lt;کانال&gt;</code>\n\n"
                      f"استان‌ها: <code>{plist}</code>\n"
                      f"مثال: <code>/add fars shiraz_news</code>\n"
-                     f"مثال: <code>/add hormozgan bandar_news</code>")
+                     f"مثال: <code>/add hormozgan bandar_news</code>\n"
+                     f"مثال: <code>/add bushehr channel_name</code>")
         return
 
     province = parts[1].strip().lower()
@@ -1471,6 +1537,7 @@ def cmd_help(chat_id):
 <b>📡 مدیریت منابع تلگرام:</b>
 <code>/add fars channel</code> — اضافه به فارس
 <code>/add hormozgan channel</code> — اضافه به هرمزگان
+<code>/add bushehr channel</code> — اضافه به بوشهر
 <code>/remove fars channel</code> — حذف منبع
 <code>/list</code> — نمایش همه منابع
 
@@ -1565,13 +1632,15 @@ def ensure_init():
         print(f"⏱ هر {CHECK_INTERVAL_DEFAULT // 60} دقیقه")
         print("=" * 50)
 
-        # Background threads
-        threading.Thread(target=scraper_loop, daemon=True).start()
-        threading.Thread(target=web_scraper_loop, daemon=True).start()
-        threading.Thread(target=handle_commands, daemon=True).start()
+        # GitHub Actions one-shot mode: scan once, then exit.
+        # Do not start permanent loops or Telegram command polling in this mode.
+        if not SCAN_ONCE:
+            threading.Thread(target=scraper_loop, daemon=True).start()
+            threading.Thread(target=web_scraper_loop, daemon=True).start()
+            threading.Thread(target=handle_commands, daemon=True).start()
 
         _initialized = True
-        print("✅ All systems started!")
+        print("✅ Initialization complete!" if SCAN_ONCE else "✅ All systems started!")
 
 
 # Auto-initialize on import (for gunicorn / Render)
@@ -1589,8 +1658,17 @@ def main():
     if not BOT_TOKEN:
         print("❌ TELEGRAM_BOT_TOKEN not set! Add to Secrets/Environment.")
         return
-    if not FARS_CHANNEL and not BND_CHANNEL:
-        print("❌ At least one channel ID needed! Set FARS_CHANNEL_ID or BND_CHANNEL_ID.")
+    if not FARS_CHANNEL and not BND_CHANNEL and not BUSHEHR_CHANNEL:
+        print("❌ At least one channel ID needed! Set FARS_CHANNEL_ID, BND_CHANNEL_ID, or BUSHEHR_CHANNEL_ID.")
+        return
+
+    if SCAN_ONCE:
+        print("🚀 One-shot scan: Telegram provincial + national sources, then web RSS.")
+        check_all_channels()
+        check_national_channels()
+        check_all_web_sources()
+        check_national_web_sources()
+        print("✅ One-shot scan finished.")
         return
 
     # Flask (main thread)
