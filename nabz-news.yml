@@ -1,0 +1,53 @@
+name: NABZ News Collector
+
+on:
+  schedule:
+    - cron: "17,47 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: nabz-news-collector
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  collect-and-forward:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout project and saved database
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Collect and forward news
+        env:
+          NABZ_SCAN_ONCE: "1"
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          FARS_CHANNEL_ID: ${{ secrets.FARS_CHANNEL_ID }}
+          BND_CHANNEL_ID: ${{ secrets.BND_CHANNEL_ID }}
+          BUSHEHR_CHANNEL_ID: ${{ secrets.BUSHEHR_CHANNEL_ID }}
+          ADMIN_USER_ID: ${{ secrets.ADMIN_USER_ID }}
+        run: python main.py
+
+      - name: Save deduplication database
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git diff --quiet -- nabz_data.db; then
+            git add nabz_data.db
+            git commit -m "Update NABZ news scan state"
+            git push
+          else
+            echo "Database unchanged."
+          fi
