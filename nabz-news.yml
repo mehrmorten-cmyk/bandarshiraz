@@ -15,7 +15,7 @@ permissions:
 jobs:
   collect-and-forward:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 25
     steps:
       - name: Checkout project and saved database
         uses: actions/checkout@v4
